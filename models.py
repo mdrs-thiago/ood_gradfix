@@ -1,0 +1,119 @@
+import torch
+import torch.nn as nn
+
+from torchvision.models import (
+    resnet18, ResNet18_Weights,
+    convnext_tiny, ConvNeXt_Tiny_Weights,
+    efficientnet_b0, EfficientNet_B0_Weights,
+    vit_b_16, ViT_B_16_Weights,
+)
+
+def compute_class_weights_from_splits(train_split, device):
+    counts = torch.tensor([len(paths) for paths in train_split], dtype=torch.float)
+    total = counts.sum()
+    weights = total / (counts.clamp(min=1.0))  # inverse frequency
+    weights = weights / weights.mean()         # normalize
+    return weights.to(device)
+
+def freeze_parameters(model):
+    for param in model.parameters():
+        param.requires_grad = False
+    
+
+def build_torchvision_model(name, num_classes, pretrained=True):
+
+    name = name.lower()
+
+    if name == "resnet18":
+        weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        model = resnet18(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        for param in model.fc.parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "convnext_tiny":
+        weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
+        model = convnext_tiny(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+        for param in model.classifier[-1].parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "efficientnet_b0":
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        model = efficientnet_b0(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+        for param in model.classifier[-1].parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "vit_b_16":
+        weights = ViT_B_16_Weights.IMAGENET1K_V1 if pretrained else None
+        model = vit_b_16(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.heads[-1] = nn.Linear(model.heads[-1].in_features, num_classes)
+        for param in model.heads[-1].parameters():
+            param.requires_grad = True
+        return model, weights
+
+    raise ValueError(f"Unknown model name: {name}")
+
+def set_classifier_head(model, model_name, num_classes, dropout_p=0.2):
+    """
+    Replaces the final classifier with Dropout + Linear, and returns the *head module*
+    whose parameters should be trained.
+    """
+    name = model_name.lower()
+
+    if name == "resnet18":
+        in_features = model.fc.in_features
+        model.fc = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, num_classes),
+        )
+        return model.fc
+
+    if name in ("efficientnet_b0",):
+        in_features = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, num_classes),
+        )
+        return model.classifier[-1]
+
+    if name in ("convnext_tiny",):
+        in_features = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, num_classes),
+        )
+        return model.classifier[-1]
+
+    if name in ("vit_b_16",):
+        # torchvision ViT: model.heads is a Sequential; last is Linear
+        in_features = model.heads[-1].in_features
+        model.heads[-1] = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, num_classes),
+        )
+        return model.heads[-1]
+
+    raise ValueError(f"Unsupported model_name for head replacement: {model_name}")
+
+
+def freeze_backbone_train_head_only(model, head_module):
+    """
+    Freezes all parameters, then unfreezes only those inside head_module.
+    """
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in head_module.parameters():
+        p.requires_grad = True
