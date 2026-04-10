@@ -1,0 +1,155 @@
+#!/bin/bash
+#SBATCH --job-name="ood_full_grid"
+#SBATCH --partition=redecia
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
+#SBATCH --output=logs/%j_master.out
+
+module load miniconda3
+
+. /home/$USER/miniconda3/etc/profile.d/conda.sh
+conda activate sound
+
+export CUDA_VISIBLE_DEVICES=2
+
+mkdir -p logs
+
+# -----------------------------
+# MODELS
+# -----------------------------
+MODELS=(
+  "google/vit-base-patch16-224"
+  "microsoft/resnet-50"
+)
+
+# -----------------------------
+# ID DATASETS
+# -----------------------------
+ID_DATASETS=(
+  "cifar10"
+  "cifar100"
+)
+
+# -----------------------------
+# OOD DATASETS (COMMON BENCHMARKS)
+# -----------------------------
+OOD_DATASETS=(
+  "svhn"
+  "places365"
+  "lsun"
+  "sun397"
+  "dtd"
+  "food101"
+  "oxford_flowers102"
+  "stanford_cars"
+)
+
+# -----------------------------
+# DATASET-SPECIFIC LOGIC
+# -----------------------------
+
+get_ood_config () {
+  case $1 in
+    svhn) echo "cropped_digits" ;;
+    places365) echo "" ;;
+    lsun) echo "classroom" ;;   # default LSUN class
+    sun397) echo "" ;;
+    dtd) echo "" ;;
+    food101) echo "" ;;
+    oxford_flowers102) echo "" ;;
+    stanford_cars) echo "" ;;
+    *) echo "" ;;
+  esac
+}
+
+get_ood_split () {
+  case $1 in
+    svhn) echo "test" ;;
+    places365) echo "validation" ;;   # HF uses validation
+    lsun) echo "train" ;;             # many LSUN configs lack test
+    sun397) echo "test" ;;
+    dtd) echo "test" ;;
+    food101) echo "validation" ;;
+    oxford_flowers102) echo "validation" ;;
+    stanford_cars) echo "test" ;;
+    *) echo "test" ;;
+  esac
+}
+
+# -----------------------------
+# METHODS
+# -----------------------------
+METHODS="msp,energy,odin,feat_knn,feat_maha,lowdim_grad_resid,twosided_resid,gradvec_maha"
+
+# -----------------------------
+# PARALLEL CONTROL
+# -----------------------------
+MAX_JOBS=2
+
+# -----------------------------
+# RUN FUNCTION
+# -----------------------------
+run_experiment () {
+  MODEL=$1
+  ID_DATASET=$2
+  OOD_DATASET=$3
+
+  OOD_CONFIG=$(get_ood_config $OOD_DATASET)
+  OOD_SPLIT=$(get_ood_split $OOD_DATASET)
+
+  MODEL_NAME=$(echo $MODEL | tr '/' '_')
+
+  LOG_FILE="logs/${MODEL_NAME}_${ID_DATASET}_vs_${OOD_DATASET}.out"
+
+  echo "========================================"
+  echo "MODEL: $MODEL"
+  echo "ID:    $ID_DATASET"
+  echo "OOD:   $OOD_DATASET"
+  echo "CFG:   $OOD_CONFIG"
+  echo "SPLIT: $OOD_SPLIT"
+  echo "LOG:   $LOG_FILE"
+  echo "========================================"
+
+  python hf_ood_eval.py \
+    --model_id "$MODEL" \
+    --id_dataset "$ID_DATASET" \
+    --ood_dataset "$OOD_DATASET" \
+    --ood_config "$OOD_CONFIG" \
+    --ood_test_split "$OOD_SPLIT" \
+    --methods "$METHODS" \
+    --test_batch_size 1 \
+    --max_ood_test 2000 \
+    --max_id_test 2000 \
+    --max_id_train 10000 \
+    --num_workers 2 \
+    > "$LOG_FILE" 2>&1
+}
+
+# -----------------------------
+# GRID EXECUTION
+# -----------------------------
+job_count=0
+
+for MODEL in "${MODELS[@]}"; do
+  for ID in "${ID_DATASETS[@]}"; do
+    for OOD in "${OOD_DATASETS[@]}"; do
+
+      run_experiment "$MODEL" "$ID" "$OOD" &
+
+      ((job_count++))
+
+      # Control parallelism
+      if (( job_count % MAX_JOBS == 0 )); then
+        wait
+      fi
+
+    done
+  done
+done
+
+wait
+
+echo "All experiments completed."
