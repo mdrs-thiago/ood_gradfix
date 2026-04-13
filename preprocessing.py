@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision.datasets import CIFAR100, SVHN
+from torchvision.datasets import CIFAR100, SVHN, SUN397, StanfordCars, Places365, Flowers102, LSUN
 from torchvision import transforms
 
 def get_traditional_dataset(dataset_name, batch_size=32, num_workers=2, transform_data=None, only_test=False):
@@ -21,6 +21,47 @@ def get_traditional_dataset(dataset_name, batch_size=32, num_workers=2, transfor
         test_dataset = SVHN(root='./data', split='test', download=True, transform=transform_data)
         if not only_test:
             train_dataset = SVHN(root='./data', split='train', download=True, transform=transform_data)
+            train_size = int(0.8 * len(train_dataset))
+            val_size = len(train_dataset) - train_size
+            train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    elif dataset_name.lower() == 'sun397':
+        # SUN397 does not have a split argument
+        test_dataset = SUN397(root='./data', transform=transform_data, download=True)
+        if not only_test:
+            train_size = int(0.8 * len(test_dataset))
+            val_size = len(test_dataset) - train_size
+            train_dataset, val_dataset = random_split(test_dataset, [train_size, val_size])
+
+    elif dataset_name.lower() == 'stanford_cars':
+        test_dataset = StanfordCars(root='./data', split='test', download=True, transform=transform_data)
+        if not only_test:
+            train_dataset = StanfordCars(root='./data', split='train', download=True, transform=transform_data)
+            train_size = int(0.8 * len(train_dataset))
+            val_size = len(train_dataset) - train_size
+            train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    elif dataset_name.lower() == 'places365':
+        test_dataset = Places365(root='./data', split='val', download=True, transform=transform_data)
+        if not only_test:
+            train_dataset = Places365(root='./data', split='train-standard', download=True, transform=transform_data)
+            train_size = int(0.8 * len(train_dataset))
+            val_size = len(train_dataset) - train_size
+            train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    elif dataset_name.lower() == 'oxford_flowers102':
+        test_dataset = Flowers102(root='./data', split='test', download=True, transform=transform_data)
+        if not only_test:
+            train_dataset = Flowers102(root='./data', split='train', download=True, transform=transform_data)
+            train_size = int(0.8 * len(train_dataset))
+            val_size = len(train_dataset) - train_size
+            train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+    elif dataset_name.lower() == 'lsun':
+        # LSUN uses 'classes' flag for test/train splits and does not use download=True
+        test_dataset = LSUN(root='./data', classes='test', transform=transform_data)
+        if not only_test:
+            train_dataset = LSUN(root='./data', classes='train', transform=transform_data)
             train_size = int(0.8 * len(train_dataset))
             val_size = len(train_dataset) - train_size
             train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])

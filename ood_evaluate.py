@@ -21,3 +21,24 @@ def compute_fpr_at_tpr95(in_scores, out_scores):
     tpr95_index = np.where(recall >= 0.95)[0][0]
     fpr_at_tpr95 = 1 - precision[tpr95_index]
     return fpr_at_tpr95
+
+def gather_metrics(metrics_list):
+    """
+    Given a list of metric dictionaries, compute best, mean, and std for each metric.
+    """
+    aggregated = {}
+    if not metrics_list:
+        return aggregated
+    
+    keys = metrics_list[0].keys()
+    for k in keys:
+        vals = [m[k] for m in metrics_list]
+        aggregated[f"{k}_mean"] = np.mean(vals)
+        aggregated[f"{k}_std"] = np.std(vals)
+        
+        if k in ['auroc', 'aupr']:
+            aggregated[f"{k}_best"] = np.max(vals)
+        else:
+            aggregated[f"{k}_best"] = np.min(vals)
+            
+    return aggregated

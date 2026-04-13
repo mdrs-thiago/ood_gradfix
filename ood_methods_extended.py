@@ -508,13 +508,23 @@ class LowDimGradResidual(OODMethod):
         n_comp = max(1, min(max_k, self.max_components, n_comp))
 
         self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
+        buffer = []
         for x, _ in _iter_inputs(loader):
             x = _to_device(x, device)
             head_io = self.extractor.forward(x)
             G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
             v = G.flatten(1).detach().cpu().numpy()
             Xc = v - self.mean_
-            self.pca.partial_fit(Xc)
+            buffer.append(Xc)
+            
+            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
+                self.pca.partial_fit(np.concatenate(buffer, axis=0))
+                buffer = []
+                
+        if buffer:
+            buffer_cat = np.concatenate(buffer, axis=0)
+            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
+                self.pca.partial_fit(buffer_cat)
 
     def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
         if self.pca is None or self.mean_ is None:
@@ -589,13 +599,23 @@ class GradVecMahalanobis(OODMethod):
         n_comp = max(1, min(max_k, self.max_components, n_comp))
 
         self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
+        buffer = []
         for x, _ in _iter_inputs(loader):
             x = _to_device(x, device)
             head_io = self.extractor.forward(x)
             G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
             v = G.flatten(1).detach().cpu().numpy()
             Xc = v - self.mean_
-            self.pca.partial_fit(Xc)
+            buffer.append(Xc)
+            
+            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
+                self.pca.partial_fit(np.concatenate(buffer, axis=0))
+                buffer = []
+                
+        if buffer:
+            buffer_cat = np.concatenate(buffer, axis=0)
+            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
+                self.pca.partial_fit(buffer_cat)
 
         labels: List[int] = []
         Xr_chunks: List[np.ndarray] = []

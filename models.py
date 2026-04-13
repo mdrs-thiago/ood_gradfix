@@ -3,6 +3,11 @@ import torch.nn as nn
 
 from torchvision.models import (
     resnet18, ResNet18_Weights,
+    resnet50, ResNet50_Weights,
+    densenet121, DenseNet121_Weights,
+    mobilenet_v3_small, MobileNet_V3_Small_Weights,
+    mobilenet_v3_large, MobileNet_V3_Large_Weights,
+    swin_t, Swin_T_Weights,
     convnext_tiny, ConvNeXt_Tiny_Weights,
     efficientnet_b0, EfficientNet_B0_Weights,
     vit_b_16, ViT_B_16_Weights,
@@ -34,6 +39,46 @@ def build_torchvision_model(name, num_classes, pretrained=True):
             param.requires_grad = True
         return model, weights
 
+    if name == "resnet50":
+        weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        model = resnet50(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        for param in model.fc.parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "densenet121":
+        weights = DenseNet121_Weights.IMAGENET1K_V1 if pretrained else None
+        model = densenet121(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "mobilenet_v3_small":
+        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        model = mobilenet_v3_small(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+        for param in model.classifier[-1].parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "mobilenet_v3_large":
+        weights = MobileNet_V3_Large_Weights.IMAGENET1K_V1 if pretrained else None
+        model = mobilenet_v3_large(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+        for param in model.classifier[-1].parameters():
+            param.requires_grad = True
+        return model, weights
+
     if name == "convnext_tiny":
         weights = ConvNeXt_Tiny_Weights.IMAGENET1K_V1 if pretrained else None
         model = convnext_tiny(weights=weights)
@@ -51,6 +96,16 @@ def build_torchvision_model(name, num_classes, pretrained=True):
             param.requires_grad = False
         model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
         for param in model.classifier[-1].parameters():
+            param.requires_grad = True
+        return model, weights
+
+    if name == "swin_t":
+        weights = Swin_T_Weights.IMAGENET1K_V1 if pretrained else None
+        model = swin_t(weights=weights)
+        for param in model.parameters():
+            param.requires_grad = False
+        model.head = nn.Linear(model.head.in_features, num_classes)
+        for param in model.head.parameters():
             param.requires_grad = True
         return model, weights
 
@@ -73,7 +128,7 @@ def set_classifier_head(model, model_name, num_classes, dropout_p=0.2):
     """
     name = model_name.lower()
 
-    if name == "resnet18":
+    if name in ("resnet18", "resnet50"):
         in_features = model.fc.in_features
         model.fc = nn.Sequential(
             nn.Dropout(p=dropout_p),
@@ -81,7 +136,15 @@ def set_classifier_head(model, model_name, num_classes, dropout_p=0.2):
         )
         return model.fc
 
-    if name in ("efficientnet_b0",):
+    if name == "densenet121":
+        in_features = model.classifier.in_features
+        model.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(in_features, num_classes),
+        )
+        return model.classifier
+
+    if name in ("efficientnet_b0", "convnext_tiny", "mobilenet_v3_small", "mobilenet_v3_large"):
         in_features = model.classifier[-1].in_features
         model.classifier[-1] = nn.Sequential(
             nn.Dropout(p=dropout_p),
@@ -89,13 +152,13 @@ def set_classifier_head(model, model_name, num_classes, dropout_p=0.2):
         )
         return model.classifier[-1]
 
-    if name in ("convnext_tiny",):
-        in_features = model.classifier[-1].in_features
-        model.classifier[-1] = nn.Sequential(
+    if name == "swin_t":
+        in_features = model.head.in_features
+        model.head = nn.Sequential(
             nn.Dropout(p=dropout_p),
             nn.Linear(in_features, num_classes),
         )
-        return model.classifier[-1]
+        return model.head
 
     if name in ("vit_b_16",):
         # torchvision ViT: model.heads is a Sequential; last is Linear
