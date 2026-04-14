@@ -55,7 +55,7 @@ get_ood_config () {
   case $1 in
     svhn) echo "cropped_digits" ;;
     places365) echo "" ;;
-    lsun) echo "classroom" ;;   # default LSUN class
+    lsun) echo "" ;;
     sun397) echo "" ;;
     dtd) echo "" ;;
     food101) echo "" ;;
@@ -68,8 +68,8 @@ get_ood_config () {
 get_ood_split () {
   case $1 in
     svhn) echo "test" ;;
-    places365) echo "validation" ;;   # HF uses validation
-    lsun) echo "train" ;;             # many LSUN configs lack test
+    places365) echo "train" ;;
+    lsun) echo "train" ;;
     sun397) echo "test" ;;
     dtd) echo "test" ;;
     food101) echo "validation" ;;
@@ -100,6 +100,17 @@ run_experiment () {
   OOD_CONFIG=$(get_ood_config $OOD_DATASET)
   OOD_SPLIT=$(get_ood_split $OOD_DATASET)
 
+  # Map friendly dataset names to their actual Hugging Face Hub IDs
+  REAL_OOD_DATASET=$OOD_DATASET
+  case $OOD_DATASET in
+    places365) REAL_OOD_DATASET="ljnlonoljpiljm/places365-256px" ;;
+    lsun) REAL_OOD_DATASET="pcuenq/lsun-bedrooms" ;;
+    sun397) REAL_OOD_DATASET="tanganke/sun397" ;;
+    dtd) REAL_OOD_DATASET="tanganke/dtd" ;;
+    oxford_flowers102) REAL_OOD_DATASET="dpdl-benchmark/oxford_flowers102" ;;
+    stanford_cars) REAL_OOD_DATASET="tanganke/stanford_cars" ;;
+  esac
+
   MODEL_NAME=$(echo $MODEL | tr '/' '_')
 
   LOG_FILE="logs/${MODEL_NAME}_${ID_DATASET}_vs_${OOD_DATASET}.out"
@@ -108,6 +119,7 @@ run_experiment () {
   echo "MODEL: $MODEL"
   echo "ID:    $ID_DATASET"
   echo "OOD:   $OOD_DATASET"
+  echo "REAL_OOD: $REAL_OOD_DATASET"
   echo "CFG:   $OOD_CONFIG"
   echo "SPLIT: $OOD_SPLIT"
   echo "LOG:   $LOG_FILE"
@@ -116,7 +128,7 @@ run_experiment () {
   python hf_ood_eval.py \
     --model_id "$MODEL" \
     --id_dataset "$ID_DATASET" \
-    --ood_dataset "$OOD_DATASET" \
+    --ood_dataset "$REAL_OOD_DATASET" \
     --ood_config "$OOD_CONFIG" \
     --ood_test_split "$OOD_SPLIT" \
     --methods "$METHODS" \
