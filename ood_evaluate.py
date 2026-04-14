@@ -15,12 +15,13 @@ def compute_aupr(in_scores, out_scores):
     return aupr
 
 def compute_fpr_at_tpr95(in_scores, out_scores):
-    y_true = np.concatenate([np.zeros(len(in_scores)), np.ones(len(out_scores))])
-    y_scores = np.concatenate([in_scores, out_scores])
-    precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
-    tpr95_index = np.where(recall >= 0.95)[0][0]
-    fpr_at_tpr95 = 1 - precision[tpr95_index]
-    return fpr_at_tpr95
+    # Standard OOD convention: TPR=95% on In-Distribution (ID) data.
+    # Since higher scores -> more OOD, we set a threshold such that 95% of ID scores are below it.
+    threshold = np.percentile(in_scores, 95)
+    
+    # FPR is the proportion of OOD data incorrectly classified as ID (scores below threshold)
+    fpr_at_tpr95 = np.mean(out_scores < threshold)
+    return float(fpr_at_tpr95)
 
 def gather_metrics(metrics_list):
     """
