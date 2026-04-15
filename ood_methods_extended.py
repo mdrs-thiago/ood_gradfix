@@ -259,59 +259,73 @@ class FeatureKNN(OODMethod):
         super().__init__(model)
         self.k = k
         self.metric = metric
-        self.nn: Optional[NearestNeighbors] = None
+        self.H_train: Optional[torch.Tensor] = None
 
     def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
-        self.nn = NearestNeighbors(n_neighbors=self.k, metric=self.metric, n_jobs=1)
-        self.nn.fit(h.cpu().numpy())
+        self.H_train = h.cpu()
 
     def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-        if self.nn is None:
+        if self.H_train is None:
             raise RuntimeError("FeatureKNN.fit must be called before scoring.")
-        dists, _ = self.nn.kneighbors(h.cpu().numpy(), n_neighbors=self.k)
-        return torch.from_numpy(dists.mean(axis=1))
+        device = next(self.model.parameters()).device
+        H_test = h.to(device)
+        H_train = self.H_train.to(device)
+        scores = []
+        batch_size = 512
+        for i in range(0, H_test.size(0), batch_size):
+            h_b = H_test[i:i+batch_size]
+            dists = torch.cdist(h_b, H_train, p=2)
+            k_dists, _ = torch.topk(dists, self.k, dim=1, largest=False)
+            scores.append(k_dists.mean(dim=1).cpu())
+        return torch.cat(scores, dim=0)
 
 
 class FeatureMahalanobis(OODMethod):
     def __init__(self, model: torch.nn.Module, shrinkage: float = 1e-6):
         super().__init__(model)
         self.shrinkage = shrinkage
-        self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self.class_stats: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         if y is None:
             raise RuntimeError("FeatureMahalanobis.fit requires labels.")
-        X = h.cpu().numpy()
-        y_np = y.reshape(-1).cpu().numpy()
+        device = next(self.model.parameters()).device
+        X = h.to(device)
+        y = y.reshape(-1).to(device)
         self.class_stats = {}
         class_means = {}
-        X_centered = np.zeros_like(X)
-        for c in np.unique(y_np):
-            Xc = X[y_np == c]
-            mu = Xc.mean(axis=0)
-            class_means[int(c)] = mu
-            X_centered[y_np == c] = Xc - mu
+        X_centered = torch.zeros_like(X)
+        classes = torch.unique(y)
+        for c in classes:
+            Xc = X[y == c]
+            mu = Xc.mean(dim=0)
+            class_means[int(c.item())] = mu
+            X_centered[y == c] = Xc - mu
             
-        cov = np.cov(X_centered, rowvar=False) + self.shrinkage * np.eye(X.shape[1])
-        inv_cov = np.linalg.inv(cov)
+        cov = (X_centered.T @ X_centered) / max(1, X.size(0) - 1) + self.shrinkage * torch.eye(X.size(1), device=device)
+        inv_cov = torch.linalg.inv(cov)
         
-        for c in np.unique(y_np):
-            self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
+        for c in classes:
+            self.class_stats[int(c.item())] = (class_means[int(c.item())].cpu(), inv_cov.cpu())
 
     def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if not self.class_stats:
             raise RuntimeError("FeatureMahalanobis.fit must be called before scoring.")
-        X = h.cpu().numpy()
+        device = next(self.model.parameters()).device
+        X = h.to(device)
         scores = []
-        for i in range(X.shape[0]):
-            xi = X[i]
-            best = np.inf
+        batch_size = 512
+        for i in range(0, X.size(0), batch_size):
+            x_b = X[i:i+batch_size]
+            b_scores = torch.full((x_b.size(0),), float('inf'), device=device)
             for mu, inv_cov in self.class_stats.values():
-                d = xi - mu
-                md = float(np.sqrt(d.T @ inv_cov @ d))
-                best = min(best, md)
-            scores.append(best)
-        return torch.tensor(scores)
+                mu = mu.to(device)
+                inv_cov = inv_cov.to(device)
+                d = x_b - mu
+                md = torch.sqrt((d @ inv_cov * d).sum(dim=1).clamp_min(0))
+                b_scores = torch.min(b_scores, md)
+            scores.append(b_scores.cpu())
+        return torch.cat(scores, dim=0)
 
 
 # ----------------------------
@@ -386,68 +400,79 @@ class LowDimGradResidual(OODMethod):
         self.temperature = temperature
         self.n_components = n_components
         self.max_components = max_components
-        self.pca_batch_size = pca_batch_size
-        self.pca: Optional[IncrementalPCA] = None
-        self.mean_: Optional[np.ndarray] = None
+        self.E: Optional[torch.Tensor] = None
+        self.L: Optional[torch.Tensor] = None
+        self.H_train: Optional[torch.Tensor] = None
+        self.Delta_train: Optional[torch.Tensor] = None
+        self.G_train_mean_row: Optional[torch.Tensor] = None
+        self.G_train_mean_all: float = 0.0
 
     def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         device = next(self.model.parameters()).device
-        N = h.shape[0]
-        sum_vec = None
-        d_feats = h.shape[1] * logits.shape[1]
+        H = h.to(device)
+        logits_d = logits.to(device)
+        Delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
         
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            if sum_vec is None:
-                sum_vec = v_batch.sum(axis=0, dtype=np.float64)
-            else:
-                sum_vec += v_batch.sum(axis=0, dtype=np.float64)
-                
-        self.mean_ = (sum_vec / N).astype(np.float32, copy=False)[None, :]
+        self.H_train = H.cpu()
+        self.Delta_train = Delta.cpu()
         
-        max_k = min(N, d_feats)
+        G = (Delta @ Delta.T) * (H @ H.T)
+        self.G_train_mean_row = G.mean(dim=1, keepdim=True)
+        self.G_train_mean_all = G.mean().item()
+        
+        G_c = G - self.G_train_mean_row - self.G_train_mean_row.T + self.G_train_mean_all
+        G_c = (G_c + G_c.T) / 2.0
+        
+        evals, evecs = torch.linalg.eigh(G_c)
+        idx = torch.argsort(evals, descending=True)
+        evals = evals[idx]
+        evecs = evecs[:, idx]
+        
+        energy = evals.clamp_min(0)
+        cum = torch.cumsum(energy, dim=0) / energy.sum().clamp_min(1e-12)
+        
         if isinstance(self.n_components, float):
-            n_comp = max(1, int(max_k * self.n_components))
+            k = int(torch.searchsorted(cum, torch.tensor(self.n_components, device=cum.device)).item() + 1)
         else:
-            n_comp = int(self.n_components)
-        n_comp = max(1, min(max_k, self.max_components, n_comp))
+            k = int(self.n_components)
+        k = max(1, min(k, self.max_components, evecs.size(1)))
         
-        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
-        buffer = []
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            Xc = v_batch - self.mean_
-            buffer.append(Xc)
-            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
-                self.pca.partial_fit(np.concatenate(buffer, axis=0))
-                buffer = []
-        if buffer:
-            buffer_cat = np.concatenate(buffer, axis=0)
-            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
-                self.pca.partial_fit(buffer_cat)
+        self.E = evecs[:, :k].cpu()
+        self.L = evals[:k].clamp_min(1e-12).cpu()
 
     def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-        if self.pca is None or self.mean_ is None:
+        if self.E is None:
             raise RuntimeError("LowDimGradResidual.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        N = h.shape[0]
+        H_test = h.to(device)
+        logits_d = logits.to(device)
+        Delta_test = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        
+        H_train = self.H_train.to(device)
+        Delta_train = self.Delta_train.to(device)
+        E = self.E.to(device)
+        L = self.L.to(device)
+        G_mean_row = self.G_train_mean_row.to(device).squeeze(1)
+        G_mean_all = self.G_train_mean_all
+        
+        N_test = H_test.size(0)
         scores = []
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            Xc = v_batch - self.mean_
-            Z = self.pca.transform(Xc)
-            Xrec = self.pca.inverse_transform(Z)
-            resid = np.linalg.norm(Xc - Xrec, axis=1)
-            scores.append(torch.from_numpy(resid))
+        batch_size = 512
+        for i in range(0, N_test, batch_size):
+            h_b = H_test[i:i+batch_size]
+            d_b = Delta_test[i:i+batch_size]
+            
+            K_test = (d_b @ Delta_train.T) * (h_b @ H_train.T)
+            K_test_c = K_test - K_test.mean(dim=1, keepdim=True) - G_mean_row.unsqueeze(0) + G_mean_all
+            
+            z_pca = K_test_c @ E / torch.sqrt(L)
+            norm2_v = (d_b * d_b).sum(dim=1) * (h_b * h_b).sum(dim=1)
+            norm2_v_c = norm2_v - 2 * K_test.mean(dim=1) + G_mean_all
+            
+            resid2 = norm2_v_c - (z_pca**2).sum(dim=1)
+            resid = torch.sqrt(resid2.clamp_min(0))
+            scores.append(resid.cpu())
+            
         return torch.cat(scores, dim=0)
 
 
@@ -459,103 +484,108 @@ class GradVecMahalanobis(OODMethod):
         self.n_components = n_components
         self.shrinkage = shrinkage
         self.max_components = max_components
-        self.pca_batch_size = pca_batch_size
-        self.pca: Optional[IncrementalPCA] = None
-        self.mean_: Optional[np.ndarray] = None
-        self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self.E: Optional[torch.Tensor] = None
+        self.L: Optional[torch.Tensor] = None
+        self.H_train: Optional[torch.Tensor] = None
+        self.Delta_train: Optional[torch.Tensor] = None
+        self.G_train_mean_row: Optional[torch.Tensor] = None
+        self.G_train_mean_all: float = 0.0
+        self.class_stats: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         if y is None:
             raise RuntimeError("GradVecMahalanobis.fit requires labels.")
         device = next(self.model.parameters()).device
-        N = h.shape[0]
-        sum_vec = None
-        d_feats = h.shape[1] * logits.shape[1]
+        H = h.to(device)
+        logits_d = logits.to(device)
+        Delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
         
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            if sum_vec is None:
-                sum_vec = v_batch.sum(axis=0, dtype=np.float64)
-            else:
-                sum_vec += v_batch.sum(axis=0, dtype=np.float64)
-                
-        self.mean_ = (sum_vec / N).astype(np.float32, copy=False)[None, :]
+        self.H_train = H.cpu()
+        self.Delta_train = Delta.cpu()
         
-        max_k = min(N, d_feats)
+        G = (Delta @ Delta.T) * (H @ H.T)
+        self.G_train_mean_row = G.mean(dim=1, keepdim=True)
+        self.G_train_mean_all = G.mean().item()
+        
+        G_c = G - self.G_train_mean_row - self.G_train_mean_row.T + self.G_train_mean_all
+        G_c = (G_c + G_c.T) / 2.0
+        
+        evals, evecs = torch.linalg.eigh(G_c)
+        idx = torch.argsort(evals, descending=True)
+        evals = evals[idx]
+        evecs = evecs[:, idx]
+        
+        energy = evals.clamp_min(0)
+        cum = torch.cumsum(energy, dim=0) / energy.sum().clamp_min(1e-12)
+        
         if isinstance(self.n_components, float):
-            n_comp = max(1, int(max_k * self.n_components))
+            k = int(torch.searchsorted(cum, torch.tensor(self.n_components, device=cum.device)).item() + 1)
         else:
-            n_comp = int(self.n_components)
-        n_comp = max(1, min(max_k, self.max_components, n_comp))
+            k = int(self.n_components)
+        k = max(1, min(k, self.max_components, evecs.size(1)))
         
-        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
-        buffer = []
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            Xc = v_batch - self.mean_
-            buffer.append(Xc)
-            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
-                self.pca.partial_fit(np.concatenate(buffer, axis=0))
-                buffer = []
-        if buffer:
-            buffer_cat = np.concatenate(buffer, axis=0)
-            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
-                self.pca.partial_fit(buffer_cat)
-
-        Xr_list = []
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            Xc = v_batch - self.mean_
-            Xr_list.append(self.pca.transform(Xc))
-        Xr = np.concatenate(Xr_list, axis=0)
+        self.E = evecs[:, :k].cpu()
+        self.L = evals[:k].clamp_min(1e-12).cpu()
         
-        y_np = y.reshape(-1).cpu().numpy()
+        E_d = self.E.to(device)
+        L_d = self.L.to(device)
+        Z_train = G_c @ E_d / torch.sqrt(L_d)
+        
+        y_np = y.reshape(-1).to(device)
         self.class_stats = {}
         class_means = {}
-        Xr_centered = np.zeros_like(Xr)
-        for c in np.unique(y_np):
-            Xc_c = Xr[y_np == c]
-            mu = Xc_c.mean(axis=0)
-            class_means[int(c)] = mu
-            Xr_centered[y_np == c] = Xc_c - mu
-            
-        cov = np.cov(Xr_centered, rowvar=False) + self.shrinkage * np.eye(Xr.shape[1])
-        inv_cov = np.linalg.inv(cov)
+        Z_centered = torch.zeros_like(Z_train)
+        classes = torch.unique(y_np)
         
-        for c in np.unique(y_np):
-            self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
+        for c in classes:
+            Z_c = Z_train[y_np == c]
+            mu = Z_c.mean(dim=0)
+            class_means[int(c.item())] = mu
+            Z_centered[y_np == c] = Z_c - mu
+            
+        cov_c = (Z_centered.T @ Z_centered) / max(1, Z_train.size(0) - 1)
+        cov_c = cov_c + self.shrinkage * torch.eye(Z_train.size(1), device=device)
+        inv_cov = torch.linalg.inv(cov_c)
+        
+        for c in classes:
+            self.class_stats[int(c.item())] = (class_means[int(c.item())].cpu(), inv_cov.cpu())
 
     def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
-        if self.pca is None or self.mean_ is None or not self.class_stats:
+        if self.E is None or not self.class_stats:
             raise RuntimeError("GradVecMahalanobis.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        N = h.shape[0]
+        H_test = h.to(device)
+        logits_d = logits.to(device)
+        Delta_test = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        
+        H_train = self.H_train.to(device)
+        Delta_train = self.Delta_train.to(device)
+        E = self.E.to(device)
+        L = self.L.to(device)
+        G_mean_row = self.G_train_mean_row.to(device).squeeze(1)
+        G_mean_all = self.G_train_mean_all
+        
+        N_test = H_test.size(0)
         scores = []
-        for i in range(0, N, self.pca_batch_size):
-            h_batch = h[i:i+self.pca_batch_size].to(device)
-            logits_batch = logits[i:i+self.pca_batch_size].to(device)
-            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
-            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
-            Xc = v_batch - self.mean_
-            Z = self.pca.transform(Xc)
-            for j in range(Z.shape[0]):
-                zi = Z[j]
-                best = np.inf
-                for mu, inv_cov in self.class_stats.values():
-                    d = zi - mu
-                    md = float(np.sqrt(d.T @ inv_cov @ d))
-                    best = min(best, md)
-                scores.append(best)
-        return torch.tensor(scores)
+        batch_size = 512
+        for i in range(0, N_test, batch_size):
+            h_b = H_test[i:i+batch_size]
+            d_b = Delta_test[i:i+batch_size]
+            
+            K_test = (d_b @ Delta_train.T) * (h_b @ H_train.T)
+            K_test_c = K_test - K_test.mean(dim=1, keepdim=True) - G_mean_row.unsqueeze(0) + G_mean_all
+            Z_test = K_test_c @ E / torch.sqrt(L)
+            
+            z_scores = torch.full((Z_test.size(0),), float('inf'), device=device)
+            for mu, inv_cov in self.class_stats.values():
+                mu = mu.to(device)
+                inv_cov = inv_cov.to(device)
+                diff = Z_test - mu
+                dist = torch.sqrt((diff @ inv_cov * diff).sum(dim=1).clamp_min(0))
+                z_scores = torch.min(z_scores, dist)
+            scores.append(z_scores.cpu())
+            
+        return torch.cat(scores, dim=0)
 
 
 # ----------------------------
