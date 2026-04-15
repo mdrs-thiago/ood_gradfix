@@ -6,6 +6,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 from datasets import load_dataset
 from transformers import AutoImageProcessor, AutoModelForImageClassification
