@@ -216,6 +216,30 @@ def main():
 
     print("Selected methods:", ", ".join(selected))
 
+    def extract_all_features(model, loader, device):
+        from ood_methods_extended import HeadExtractor, _to_device, _iter_inputs
+        extractor = HeadExtractor(model)
+        feats, logits_list, labels = [], [], []
+        with torch.no_grad():
+            for x, y in _iter_inputs(loader):
+                x = _to_device(x, device)
+                head_io = extractor.forward(x)
+                feats.append(head_io.h.cpu())
+                logits_list.append(head_io.logits.cpu())
+                if y is not None:
+                    labels.append(y.cpu())
+        H = torch.cat(feats, dim=0)
+        L = torch.cat(logits_list, dim=0)
+        Y = torch.cat(labels, dim=0) if labels else None
+        return H, L, Y
+        
+    print("Pre-computing features for ID train...")
+    id_train_h, id_train_logits, id_train_y = extract_all_features(model, id_train_loader, device)
+    print("Pre-computing features for ID test...")
+    id_test_h, id_test_logits, _ = extract_all_features(model, id_test_loader, device)
+    print("Pre-computing features for OOD test...")
+    ood_test_h, ood_test_logits, _ = extract_all_features(model, ood_test_loader, device)
+
     print("\nResults:")
     heavy_fit_methods = {
         "feat_knn",
