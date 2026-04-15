@@ -275,7 +275,15 @@ def main():
                 num_workers=args.num_workers,
                 shuffle=True,
             )
-            method.fit(fit_loader)
+            if hasattr(method, "fit_features"):
+                if fit_dataset is id_train:
+                    method.fit_features(id_train_h, id_train_logits, id_train_y)
+                else:
+                    fit_loader_ext = _make_loader(fit_dataset, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
+                    f_h, f_l, f_y = extract_all_features(model, fit_loader_ext, device)
+                    method.fit_features(f_h, f_l, f_y)
+            else:
+                method.fit(fit_loader)
         except Exception as exc:  # fit may be optional
             print(f"[warn] {name}: fit failed ({exc}) - skipping scoring")
             del registry[name]
@@ -284,8 +292,12 @@ def main():
                 torch.cuda.empty_cache()
             continue
 
-        id_scores = method.compute_ood_scores(id_test_loader).cpu().numpy()
-        ood_scores = method.compute_ood_scores(ood_test_loader).cpu().numpy()
+        if hasattr(method, "compute_ood_scores_features"):
+            id_scores = method.compute_ood_scores_features(id_test_h, id_test_logits).cpu().numpy()
+            ood_scores = method.compute_ood_scores_features(ood_test_h, ood_test_logits).cpu().numpy()
+        else:
+            id_scores = method.compute_ood_scores(id_test_loader).cpu().numpy()
+            ood_scores = method.compute_ood_scores(ood_test_loader).cpu().numpy()
 
         auroc = compute_auroc(id_scores, ood_scores)
         aupr = compute_aupr(id_scores, ood_scores)
