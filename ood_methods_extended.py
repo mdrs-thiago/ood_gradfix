@@ -996,7 +996,7 @@ class FeatureGMM(OODMethod):
                 x = _to_device(x, device)
                 feats.append(self.extractor.forward(x).h.detach().cpu().numpy())
         X = np.concatenate(feats, axis=0)
-        self.gmm = GaussianMixture(n_components=self.n_components, covariance_type='full', random_state=42)
+        self.gmm = GaussianMixture(n_components=self.n_components, covariance_type='diag', random_state=42)
         self.gmm.fit(X)
 
     def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:

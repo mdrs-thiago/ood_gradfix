@@ -142,9 +142,9 @@ def main():
     parser.add_argument("--methods", type=str, default="msp,energy")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--cache_dir", type=str, default=None)
-    parser.add_argument("--max_id_train", type=int, default=None)
-    parser.add_argument("--max_id_test", type=int, default=None)
-    parser.add_argument("--max_ood_test", type=int, default=None)
+    parser.add_argument("--max_id_train", type=int, default=10000)
+    parser.add_argument("--max_id_test", type=int, default=10000)
+    parser.add_argument("--max_ood_test", type=int, default=10000)
     parser.add_argument("--auto_fit_cap", type=int, default=10000)
     args = parser.parse_args()
 
@@ -226,6 +226,10 @@ def main():
         "gradvec_maha",
         "twosided_resid",
         "twosided_code_maha",
+        "feat_gmm",
+        "feat_pca",
+        "react",
+        "vim",
     }
 
     for name in selected:
