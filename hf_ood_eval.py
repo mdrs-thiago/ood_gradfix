@@ -293,11 +293,11 @@ def main():
             continue
 
         if hasattr(method, "compute_ood_scores_features"):
-            id_scores = method.compute_ood_scores_features(id_test_h, id_test_logits).cpu().numpy()
-            ood_scores = method.compute_ood_scores_features(ood_test_h, ood_test_logits).cpu().numpy()
+            id_scores = method.compute_ood_scores_features(id_test_h, id_test_logits).detach().cpu().numpy()
+            ood_scores = method.compute_ood_scores_features(ood_test_h, ood_test_logits).detach().cpu().numpy()
         else:
-            id_scores = method.compute_ood_scores(id_test_loader).cpu().numpy()
-            ood_scores = method.compute_ood_scores(ood_test_loader).cpu().numpy()
+            id_scores = method.compute_ood_scores(id_test_loader).detach().cpu().numpy()
+            ood_scores = method.compute_ood_scores(ood_test_loader).detach().cpu().numpy()
 
         auroc = compute_auroc(id_scores, ood_scores)
         aupr = compute_aupr(id_scores, ood_scores)
