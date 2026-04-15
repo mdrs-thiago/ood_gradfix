@@ -329,11 +329,10 @@ class GradNorm(OODMethod):
         h = h.to(next(self.model.parameters()).device)
         logits = logits.to(h.device)
         delta = _compute_delta(logits, loss_type=self.loss_type, temperature=self.temperature)
-        G = delta.unsqueeze(2) * h.unsqueeze(1)
         if self.p == "fro":
-            s = torch.linalg.vector_norm(G.flatten(1), ord=2, dim=1)
+            s = torch.linalg.vector_norm(delta, ord=2, dim=1) * torch.linalg.vector_norm(h, ord=2, dim=1)
         elif self.p == "l1":
-            s = G.abs().flatten(1).sum(dim=1)
+            s = delta.abs().sum(dim=1) * h.abs().sum(dim=1)
         return -s.cpu()
 
 
@@ -388,40 +387,68 @@ class LowDimGradResidual(OODMethod):
         self.n_components = n_components
         self.max_components = max_components
         self.pca_batch_size = pca_batch_size
-        self.pca: Optional[PCA] = None
+        self.pca: Optional[IncrementalPCA] = None
         self.mean_: Optional[np.ndarray] = None
 
     def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         device = next(self.model.parameters()).device
-        h_d = h.to(device)
-        logits_d = logits.to(device)
-        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
-        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
-        V = G.flatten(1).cpu().numpy()
-        self.mean_ = V.mean(axis=0, keepdims=True)
-        max_k = min(V.shape[0], V.shape[1])
+        N = h.shape[0]
+        sum_vec = None
+        d_feats = h.shape[1] * logits.shape[1]
+        
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            if sum_vec is None:
+                sum_vec = v_batch.sum(axis=0, dtype=np.float64)
+            else:
+                sum_vec += v_batch.sum(axis=0, dtype=np.float64)
+                
+        self.mean_ = (sum_vec / N).astype(np.float32, copy=False)[None, :]
+        
+        max_k = min(N, d_feats)
         if isinstance(self.n_components, float):
             n_comp = max(1, int(max_k * self.n_components))
         else:
             n_comp = int(self.n_components)
         n_comp = max(1, min(max_k, self.max_components, n_comp))
-        self.pca = PCA(n_components=n_comp)
-        self.pca.fit(V - self.mean_)
+        
+        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
+        buffer = []
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            Xc = v_batch - self.mean_
+            buffer.append(Xc)
+            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
+                self.pca.partial_fit(np.concatenate(buffer, axis=0))
+                buffer = []
+        if buffer:
+            buffer_cat = np.concatenate(buffer, axis=0)
+            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
+                self.pca.partial_fit(buffer_cat)
 
     def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.pca is None or self.mean_ is None:
             raise RuntimeError("LowDimGradResidual.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        h_d = h.to(device)
-        logits_d = logits.to(device)
-        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
-        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
-        X = G.flatten(1).cpu().numpy()
-        Xc = X - self.mean_
-        Z = self.pca.transform(Xc)
-        Xrec = self.pca.inverse_transform(Z)
-        resid = np.linalg.norm(Xc - Xrec, axis=1)
-        return torch.from_numpy(resid)
+        N = h.shape[0]
+        scores = []
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            Xc = v_batch - self.mean_
+            Z = self.pca.transform(Xc)
+            Xrec = self.pca.inverse_transform(Z)
+            resid = np.linalg.norm(Xc - Xrec, axis=1)
+            scores.append(torch.from_numpy(resid))
+        return torch.cat(scores, dim=0)
 
 
 class GradVecMahalanobis(OODMethod):
@@ -433,7 +460,7 @@ class GradVecMahalanobis(OODMethod):
         self.shrinkage = shrinkage
         self.max_components = max_components
         self.pca_batch_size = pca_batch_size
-        self.pca: Optional[PCA] = None
+        self.pca: Optional[IncrementalPCA] = None
         self.mean_: Optional[np.ndarray] = None
         self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
@@ -441,21 +468,55 @@ class GradVecMahalanobis(OODMethod):
         if y is None:
             raise RuntimeError("GradVecMahalanobis.fit requires labels.")
         device = next(self.model.parameters()).device
-        h_d = h.to(device)
-        logits_d = logits.to(device)
-        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
-        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
-        V = G.flatten(1).cpu().numpy()
-        self.mean_ = V.mean(axis=0, keepdims=True)
-        max_k = min(V.shape[0], V.shape[1])
+        N = h.shape[0]
+        sum_vec = None
+        d_feats = h.shape[1] * logits.shape[1]
+        
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            if sum_vec is None:
+                sum_vec = v_batch.sum(axis=0, dtype=np.float64)
+            else:
+                sum_vec += v_batch.sum(axis=0, dtype=np.float64)
+                
+        self.mean_ = (sum_vec / N).astype(np.float32, copy=False)[None, :]
+        
+        max_k = min(N, d_feats)
         if isinstance(self.n_components, float):
             n_comp = max(1, int(max_k * self.n_components))
         else:
             n_comp = int(self.n_components)
         n_comp = max(1, min(max_k, self.max_components, n_comp))
-        self.pca = PCA(n_components=n_comp)
-        Xc = V - self.mean_
-        Xr = self.pca.fit_transform(Xc)
+        
+        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
+        buffer = []
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            Xc = v_batch - self.mean_
+            buffer.append(Xc)
+            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
+                self.pca.partial_fit(np.concatenate(buffer, axis=0))
+                buffer = []
+        if buffer:
+            buffer_cat = np.concatenate(buffer, axis=0)
+            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
+                self.pca.partial_fit(buffer_cat)
+
+        Xr_list = []
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            Xc = v_batch - self.mean_
+            Xr_list.append(self.pca.transform(Xc))
+        Xr = np.concatenate(Xr_list, axis=0)
         
         y_np = y.reshape(-1).cpu().numpy()
         self.class_stats = {}
@@ -477,22 +538,23 @@ class GradVecMahalanobis(OODMethod):
         if self.pca is None or self.mean_ is None or not self.class_stats:
             raise RuntimeError("GradVecMahalanobis.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        h_d = h.to(device)
-        logits_d = logits.to(device)
-        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
-        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
-        X = G.flatten(1).cpu().numpy()
-        Xc = X - self.mean_
-        Z = self.pca.transform(Xc)
+        N = h.shape[0]
         scores = []
-        for i in range(Z.shape[0]):
-            zi = Z[i]
-            best = np.inf
-            for mu, inv_cov in self.class_stats.values():
-                d = zi - mu
-                md = float(np.sqrt(d.T @ inv_cov @ d))
-                best = min(best, md)
-            scores.append(best)
+        for i in range(0, N, self.pca_batch_size):
+            h_batch = h[i:i+self.pca_batch_size].to(device)
+            logits_batch = logits[i:i+self.pca_batch_size].to(device)
+            delta_batch = _compute_delta(logits_batch, loss_type=self.loss_type, temperature=self.temperature)
+            v_batch = (delta_batch.unsqueeze(2) * h_batch.unsqueeze(1)).flatten(1).cpu().numpy()
+            Xc = v_batch - self.mean_
+            Z = self.pca.transform(Xc)
+            for j in range(Z.shape[0]):
+                zi = Z[j]
+                best = np.inf
+                for mu, inv_cov in self.class_stats.values():
+                    d = zi - mu
+                    md = float(np.sqrt(d.T @ inv_cov @ d))
+                    best = min(best, md)
+                scores.append(best)
         return torch.tensor(scores)
 
 
