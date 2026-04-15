@@ -157,40 +157,49 @@ def _loss_from_logits(
     raise ValueError(f"Unknown loss_type: {loss_type}")
 
 
-def _head_grad_matrix(
-    head_io: HeadIO,
+def _compute_delta(
+    logits: torch.Tensor,
     loss_type: str = "uniform_kl",
     temperature: float = 1.0,
 ) -> torch.Tensor:
-    """Compute per-sample head gradient matrix G = dL/dW as (B, K, d).
-
-    Uses autograd to compute delta = dL/dlogits, then G = delta ⊗ h.
-    """
-    logits = head_io.logits
-    h = head_io.h
-    # Ensure logits require grad
-    if not logits.requires_grad:
-        logits = logits.detach().requires_grad_(True)
-
-    loss = _loss_from_logits(logits, loss_type=loss_type, temperature=temperature)
-    # Sum to get scalar for autograd; then reshape back using grad_output ones
-    # We want per-sample delta; easiest: compute gradient of loss.sum() w.r.t logits.
-    delta = torch.autograd.grad(loss.sum(), logits, retain_graph=False, create_graph=False)[0]
-    # G[b] = delta[b][:,None] * h[b][None,:]
-    G = delta.unsqueeze(2) * h.unsqueeze(1)
-    return G
+    z = logits / temperature
+    p = torch.softmax(z, dim=1)
+    if loss_type == "uniform_kl":
+        logp = torch.log(p.clamp_min(1e-12))
+        ent = (p * logp).sum(dim=1, keepdim=True)
+        delta = p * (logp - ent) / temperature
+    elif loss_type == "entropy":
+        logp = torch.log(p.clamp_min(1e-12))
+        ent = (p * logp).sum(dim=1, keepdim=True)
+        delta = - (p * (logp - ent)) / temperature
+    elif loss_type == "ce_pred":
+        yhat = torch.argmax(z, dim=1)
+        one_hot = torch.zeros_like(p)
+        one_hot.scatter_(1, yhat.unsqueeze(1), 1.0)
+        delta = (p - one_hot) / temperature
+    else:
+        logits_req = logits.detach().requires_grad_(True)
+        loss = _loss_from_logits(logits_req, loss_type=loss_type, temperature=temperature)
+        delta = torch.autograd.grad(loss.sum(), logits_req, retain_graph=False, create_graph=False)[0]
+    return delta
 
 
 class OODMethod:
     def __init__(self, model: torch.nn.Module):
         self.model = model
         self.model.eval()
+        self.extractor = HeadExtractor(model)
 
     def fit(self, loader: Iterable[Batch]):
-        """Optional: fit statistics on in-distribution data."""
         return
 
     def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+        raise NotImplementedError
+
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        pass
+
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
 
@@ -199,16 +208,9 @@ class OODMethod:
 # ----------------------------
 
 class MSP(OODMethod):
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                logits = self.model(x)
-                p = torch.softmax(logits, dim=1)
-                scores.append(1.0 - p.max(dim=1).values.detach().cpu())
-        return torch.cat(scores, dim=0)
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        p = torch.softmax(logits, dim=1)
+        return 1.0 - p.max(dim=1).values.cpu()
 
 
 class EnergyBased(OODMethod):
@@ -216,16 +218,9 @@ class EnergyBased(OODMethod):
         super().__init__(model)
         self.temperature = temperature
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                logits = self.model(x) / self.temperature
-                energy = -torch.logsumexp(logits, dim=1)
-                scores.append(energy.detach().cpu())
-        return torch.cat(scores, dim=0)
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        energy = -torch.logsumexp(logits / self.temperature, dim=1)
+        return energy.cpu()
 
 
 class Odin(OODMethod):
@@ -260,100 +255,63 @@ class Odin(OODMethod):
 # ----------------------------
 
 class FeatureKNN(OODMethod):
-    """kNN distance in penultimate feature space."""
-
     def __init__(self, model: torch.nn.Module, k: int = 10, metric: str = "euclidean"):
         super().__init__(model)
         self.k = k
         self.metric = metric
-        self.extractor = HeadExtractor(self.model)
         self.nn: Optional[NearestNeighbors] = None
 
-    def fit(self, loader: Iterable[Batch]):
-        device = next(self.model.parameters()).device
-        feats: List[np.ndarray] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                h = self.extractor.forward(x).h
-                feats.append(h.detach().cpu().numpy())
-        X = np.concatenate(feats, axis=0)
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         self.nn = NearestNeighbors(n_neighbors=self.k, metric=self.metric, n_jobs=1)
-        self.nn.fit(X)
+        self.nn.fit(h.cpu().numpy())
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.nn is None:
             raise RuntimeError("FeatureKNN.fit must be called before scoring.")
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                h = self.extractor.forward(x).h.detach().cpu().numpy()
-                dists, _ = self.nn.kneighbors(h, n_neighbors=self.k)
-                # Use mean kNN distance as OOD score
-                scores.append(torch.from_numpy(dists.mean(axis=1)))
-        return torch.cat(scores, dim=0)
+        dists, _ = self.nn.kneighbors(h.cpu().numpy(), n_neighbors=self.k)
+        return torch.from_numpy(dists.mean(axis=1))
 
 
 class FeatureMahalanobis(OODMethod):
-    """Class-conditional Gaussian in penultimate feature space; score=min Mahalanobis."""
-
     def __init__(self, model: torch.nn.Module, shrinkage: float = 1e-6):
         super().__init__(model)
-        self.extractor = HeadExtractor(self.model)
         self.shrinkage = shrinkage
         self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
-    def fit(self, loader: Iterable[Batch]):
-        device = next(self.model.parameters()).device
-        feats: List[np.ndarray] = []
-        labels: List[int] = []
-        with torch.no_grad():
-            for x, y in _iter_inputs(loader):
-                if y is None:
-                    raise RuntimeError("FeatureMahalanobis.fit requires labels.")
-                x = _to_device(x, device)
-                h = self.extractor.forward(x).h.detach().cpu().numpy()
-                feats.append(h)
-                labels.extend(y.detach().cpu().reshape(-1).tolist())
-        X = np.concatenate(feats, axis=0)
-        y = np.array(labels)
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        if y is None:
+            raise RuntimeError("FeatureMahalanobis.fit requires labels.")
+        X = h.cpu().numpy()
+        y_np = y.reshape(-1).cpu().numpy()
         self.class_stats = {}
         class_means = {}
         X_centered = np.zeros_like(X)
-        for c in np.unique(y):
-            Xc = X[y == c]
+        for c in np.unique(y_np):
+            Xc = X[y_np == c]
             mu = Xc.mean(axis=0)
             class_means[int(c)] = mu
-            X_centered[y == c] = Xc - mu
+            X_centered[y_np == c] = Xc - mu
             
         cov = np.cov(X_centered, rowvar=False) + self.shrinkage * np.eye(X.shape[1])
         inv_cov = np.linalg.inv(cov)
         
-        for c in np.unique(y):
+        for c in np.unique(y_np):
             self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if not self.class_stats:
             raise RuntimeError("FeatureMahalanobis.fit must be called before scoring.")
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                h = self.extractor.forward(x).h.detach().cpu().numpy()
-                batch_scores = []
-                for i in range(h.shape[0]):
-                    xi = h[i]
-                    best = np.inf
-                    for mu, inv_cov in self.class_stats.values():
-                        d = xi - mu
-                        md = float(np.sqrt(d.T @ inv_cov @ d))
-                        best = min(best, md)
-                    batch_scores.append(best)
-                scores.append(torch.tensor(batch_scores))
-        return torch.cat(scores, dim=0)
+        X = h.cpu().numpy()
+        scores = []
+        for i in range(X.shape[0]):
+            xi = X[i]
+            best = np.inf
+            for mu, inv_cov in self.class_stats.values():
+                d = xi - mu
+                md = float(np.sqrt(d.T @ inv_cov @ d))
+                best = min(best, md)
+            scores.append(best)
+        return torch.tensor(scores)
 
 
 # ----------------------------
@@ -361,210 +319,113 @@ class FeatureMahalanobis(OODMethod):
 # ----------------------------
 
 class GradNorm(OODMethod):
-    """Gradient norm score on head weights for a chosen loss/target."""
-
     def __init__(self, model: torch.nn.Module, loss_type: str = "uniform_kl", p: str = "fro", temperature: float = 1.0):
         super().__init__(model)
         self.loss_type = loss_type
         self.temperature = temperature
-        self.p = p  # 'fro' or 'l1'
-        self.extractor = HeadExtractor(self.model)
+        self.p = p
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            self.model.zero_grad(set_to_none=True)
-            head_io = self.extractor.forward(x)
-            # We need gradients; do not use no_grad.
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)  # (B,K,d)
-            if self.p == "fro":
-                s = torch.linalg.vector_norm(G.flatten(1), ord=2, dim=1)
-            elif self.p == "l1":
-                s = G.abs().flatten(1).sum(dim=1)
-            else:
-                raise ValueError("p must be 'fro' or 'l1'")
-            scores.append(s.detach().cpu())
-        return torch.cat(scores, dim=0)
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        h = h.to(next(self.model.parameters()).device)
+        logits = logits.to(h.device)
+        delta = _compute_delta(logits, loss_type=self.loss_type, temperature=self.temperature)
+        G = delta.unsqueeze(2) * h.unsqueeze(1)
+        if self.p == "fro":
+            s = torch.linalg.vector_norm(G.flatten(1), ord=2, dim=1)
+        elif self.p == "l1":
+            s = G.abs().flatten(1).sum(dim=1)
+        return -s.cpu()
 
 
 class GradOrth(OODMethod):
-    """Simplified GradOrth-style score.
-
-    Fit: build feature subspace from penultimate features h (ID) via SVD/PCA.
-    Score: gradient component orthogonal to feature subspace.
-
-    For head-gradient G = delta h^T, the feature-orthogonal gradient is delta h_perp^T.
-    Score = ||delta h_perp^T||_F = ||delta|| * ||h_perp||.
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        eps_th: float = 0.95,
-        loss_type: str = "uniform_kl",
-        temperature: float = 1.0,
-        center: bool = True,
-    ):
+    def __init__(self, model: torch.nn.Module, eps_th: float = 0.95, loss_type: str = "uniform_kl", temperature: float = 1.0, center: bool = True):
         super().__init__(model)
         self.eps_th = eps_th
         self.loss_type = loss_type
         self.temperature = temperature
         self.center = center
-        self.extractor = HeadExtractor(self.model)
-        self.U: Optional[torch.Tensor] = None  # (d,k)
+        self.U: Optional[torch.Tensor] = None
         self.mu: Optional[torch.Tensor] = None
 
-    def fit(self, loader: Iterable[Batch]):
-        device = next(self.model.parameters()).device
-        feats: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                feats.append(self.extractor.forward(x).h.detach())
-        H = torch.cat(feats, dim=0)  # (N,d)
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        H = h.to(next(self.model.parameters()).device)
         if self.center:
             self.mu = H.mean(dim=0, keepdim=True)
             Hc = H - self.mu
         else:
             self.mu = torch.zeros(1, H.size(1), device=H.device)
             Hc = H
-        # Compute SVD of (d x N) matrix as in GradOrth (R = [h1,...,hN])
-        R = Hc.T  # (d,N)
-        # torch.linalg.svd returns U(d,d), S(min), Vh(N,N)
+        R = Hc.T
         U, S, _ = torch.linalg.svd(R, full_matrices=False)
         energy = (S ** 2)
         cum = torch.cumsum(energy, dim=0) / energy.sum()
         k = int(torch.searchsorted(cum, torch.tensor(self.eps_th, device=cum.device)).item() + 1)
         k = max(1, min(k, U.size(1)))
-        self.U = U[:, :k].detach()  # (d,k)
+        self.U = U[:, :k].detach()
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.U is None or self.mu is None:
             raise RuntimeError("GradOrth.fit must be called before scoring.")
         device = next(self.model.parameters()).device
         U = self.U.to(device)
         mu = self.mu.to(device)
-        scores: List[torch.Tensor] = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            # compute delta and h
-            logits = head_io.logits.detach().requires_grad_(True)
-            h = head_io.h
-            if self.center:
-                h = h - mu
-            loss = _loss_from_logits(logits, loss_type=self.loss_type, temperature=self.temperature)
-            delta = torch.autograd.grad(loss.sum(), logits, retain_graph=False, create_graph=False)[0]
-            # h_perp = h - UU^T h
-            proj = (h @ U) @ U.T
-            h_perp = h - proj
-            # Score = ||delta|| * ||h_perp||
-            s = torch.linalg.vector_norm(delta, ord=2, dim=1) * torch.linalg.vector_norm(h_perp, ord=2, dim=1)
-            scores.append(s.detach().cpu())
-        return torch.cat(scores, dim=0)
+        h = h.to(device)
+        logits = logits.to(device)
+        if self.center:
+            h = h - mu
+        delta = _compute_delta(logits, loss_type=self.loss_type, temperature=self.temperature)
+        proj = (h @ U) @ U.T
+        h_perp = h - proj
+        s = torch.linalg.vector_norm(delta, ord=2, dim=1) * torch.linalg.vector_norm(h_perp, ord=2, dim=1)
+        return -s.cpu()
 
 
 class LowDimGradResidual(OODMethod):
-    """PCA on vec(head-gradient) using ID, then use reconstruction residual norm as score."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        loss_type: str = "uniform_kl",
-        temperature: float = 1.0,
-        n_components: float = 0.95,
-        max_components: int = 256,
-        pca_batch_size: int = 512,
-    ):
+    def __init__(self, model: torch.nn.Module, loss_type: str = "uniform_kl", temperature: float = 1.0, n_components: float = 0.95, max_components: int = 256, pca_batch_size: int = 512):
         super().__init__(model)
         self.loss_type = loss_type
         self.temperature = temperature
         self.n_components = n_components
         self.max_components = max_components
         self.pca_batch_size = pca_batch_size
-        self.extractor = HeadExtractor(self.model)
         self.pca: Optional[PCA] = None
         self.mean_: Optional[np.ndarray] = None
 
-    def fit(self, loader: Iterable[Batch]):
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         device = next(self.model.parameters()).device
-        total = 0
-        sum_vec: Optional[np.ndarray] = None
-        n_features = None
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            if sum_vec is None:
-                n_features = v.shape[1]
-                sum_vec = v.sum(axis=0, dtype=np.float64)
-            else:
-                sum_vec += v.sum(axis=0, dtype=np.float64)
-            total += v.shape[0]
-        if sum_vec is None or n_features is None or total == 0:
-            raise RuntimeError("LowDimGradResidual.fit received no samples.")
-        self.mean_ = (sum_vec / total).astype(np.float32, copy=False)[None, :]
-
-        max_k = min(total, n_features)
+        h_d = h.to(device)
+        logits_d = logits.to(device)
+        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
+        V = G.flatten(1).cpu().numpy()
+        self.mean_ = V.mean(axis=0, keepdims=True)
+        max_k = min(V.shape[0], V.shape[1])
         if isinstance(self.n_components, float):
             n_comp = max(1, int(max_k * self.n_components))
         else:
             n_comp = int(self.n_components)
         n_comp = max(1, min(max_k, self.max_components, n_comp))
+        self.pca = PCA(n_components=n_comp)
+        self.pca.fit(V - self.mean_)
 
-        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
-        buffer = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            Xc = v - self.mean_
-            buffer.append(Xc)
-            
-            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
-                self.pca.partial_fit(np.concatenate(buffer, axis=0))
-                buffer = []
-                
-        if buffer:
-            buffer_cat = np.concatenate(buffer, axis=0)
-            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
-                self.pca.partial_fit(buffer_cat)
-
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.pca is None or self.mean_ is None:
             raise RuntimeError("LowDimGradResidual.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            X = G.flatten(1).detach().cpu().numpy()
-            Xc = X - self.mean_
-            Z = self.pca.transform(Xc)
-            Xrec = self.pca.inverse_transform(Z)
-            resid = np.linalg.norm(Xc - Xrec, axis=1)
-            scores.append(torch.from_numpy(resid))
-        return torch.cat(scores, dim=0)
+        h_d = h.to(device)
+        logits_d = logits.to(device)
+        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
+        X = G.flatten(1).cpu().numpy()
+        Xc = X - self.mean_
+        Z = self.pca.transform(Xc)
+        Xrec = self.pca.inverse_transform(Z)
+        resid = np.linalg.norm(Xc - Xrec, axis=1)
+        return torch.from_numpy(resid)
 
 
 class GradVecMahalanobis(OODMethod):
-    """GradVec-like baseline: use per-sample vec(head-gradient) -> PCA -> class-conditional Mahalanobis."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        loss_type: str = "uniform_kl",
-        temperature: float = 1.0,
-        n_components: float = 0.95,
-        shrinkage: float = 1e-6,
-        max_components: int = 256,
-        pca_batch_size: int = 512,
-    ):
+    def __init__(self, model: torch.nn.Module, loss_type: str = "uniform_kl", temperature: float = 1.0, n_components: float = 0.95, shrinkage: float = 1e-6, max_components: int = 256, pca_batch_size: int = 512):
         super().__init__(model)
         self.loss_type = loss_type
         self.temperature = temperature
@@ -572,111 +433,67 @@ class GradVecMahalanobis(OODMethod):
         self.shrinkage = shrinkage
         self.max_components = max_components
         self.pca_batch_size = pca_batch_size
-        self.extractor = HeadExtractor(self.model)
         self.pca: Optional[PCA] = None
         self.mean_: Optional[np.ndarray] = None
         self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
-    def fit(self, loader: Iterable[Batch]):
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        if y is None:
+            raise RuntimeError("GradVecMahalanobis.fit requires labels.")
         device = next(self.model.parameters()).device
-        total = 0
-        sum_vec: Optional[np.ndarray] = None
-        n_features = None
-        for x, y in _iter_inputs(loader):
-            if y is None:
-                raise RuntimeError("GradVecMahalanobis.fit requires labels.")
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            if sum_vec is None:
-                n_features = v.shape[1]
-                sum_vec = v.sum(axis=0, dtype=np.float64)
-            else:
-                sum_vec += v.sum(axis=0, dtype=np.float64)
-            total += v.shape[0]
-        if sum_vec is None or n_features is None or total == 0:
-            raise RuntimeError("GradVecMahalanobis.fit received no samples.")
-        self.mean_ = (sum_vec / total).astype(np.float32, copy=False)[None, :]
-
-        max_k = min(total, n_features)
+        h_d = h.to(device)
+        logits_d = logits.to(device)
+        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
+        V = G.flatten(1).cpu().numpy()
+        self.mean_ = V.mean(axis=0, keepdims=True)
+        max_k = min(V.shape[0], V.shape[1])
         if isinstance(self.n_components, float):
             n_comp = max(1, int(max_k * self.n_components))
         else:
             n_comp = int(self.n_components)
         n_comp = max(1, min(max_k, self.max_components, n_comp))
-
-        self.pca = IncrementalPCA(n_components=n_comp, batch_size=self.pca_batch_size)
-        buffer = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            Xc = v - self.mean_
-            buffer.append(Xc)
-            
-            if sum(b.shape[0] for b in buffer) >= max(n_comp, self.pca_batch_size):
-                self.pca.partial_fit(np.concatenate(buffer, axis=0))
-                buffer = []
-                
-        if buffer:
-            buffer_cat = np.concatenate(buffer, axis=0)
-            if hasattr(self.pca, 'components_') or buffer_cat.shape[0] >= n_comp:
-                self.pca.partial_fit(buffer_cat)
-
-        labels: List[int] = []
-        Xr_chunks: List[np.ndarray] = []
-        for x, y in _iter_inputs(loader):
-            if y is None:
-                raise RuntimeError("GradVecMahalanobis.fit requires labels.")
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            v = G.flatten(1).detach().cpu().numpy()
-            Xc = v - self.mean_
-            Xr_chunks.append(self.pca.transform(Xc))
-            labels.extend(y.detach().cpu().reshape(-1).tolist())
-        Xr = np.concatenate(Xr_chunks, axis=0)
-        y = np.array(labels)
+        self.pca = PCA(n_components=n_comp)
+        Xc = V - self.mean_
+        Xr = self.pca.fit_transform(Xc)
+        
+        y_np = y.reshape(-1).cpu().numpy()
         self.class_stats = {}
         class_means = {}
         Xr_centered = np.zeros_like(Xr)
-        for c in np.unique(y):
-            Xc_c = Xr[y == c]
+        for c in np.unique(y_np):
+            Xc_c = Xr[y_np == c]
             mu = Xc_c.mean(axis=0)
             class_means[int(c)] = mu
-            Xr_centered[y == c] = Xc_c - mu
+            Xr_centered[y_np == c] = Xc_c - mu
             
         cov = np.cov(Xr_centered, rowvar=False) + self.shrinkage * np.eye(Xr.shape[1])
         inv_cov = np.linalg.inv(cov)
         
-        for c in np.unique(y):
+        for c in np.unique(y_np):
             self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.pca is None or self.mean_ is None or not self.class_stats:
             raise RuntimeError("GradVecMahalanobis.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            G = _head_grad_matrix(head_io, loss_type=self.loss_type, temperature=self.temperature)
-            X = G.flatten(1).detach().cpu().numpy()
-            Xc = X - self.mean_
-            Z = self.pca.transform(Xc)
-            batch_scores = []
-            for i in range(Z.shape[0]):
-                zi = Z[i]
-                best = np.inf
-                for mu, inv_cov in self.class_stats.values():
-                    d = zi - mu
-                    md = float(np.sqrt(d.T @ inv_cov @ d))
-                    best = min(best, md)
-                batch_scores.append(best)
-            scores.append(torch.tensor(batch_scores))
-        return torch.cat(scores, dim=0)
+        h_d = h.to(device)
+        logits_d = logits.to(device)
+        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        G = delta.unsqueeze(2) * h_d.unsqueeze(1)
+        X = G.flatten(1).cpu().numpy()
+        Xc = X - self.mean_
+        Z = self.pca.transform(Xc)
+        scores = []
+        for i in range(Z.shape[0]):
+            zi = Z[i]
+            best = np.inf
+            for mu, inv_cov in self.class_stats.values():
+                d = zi - mu
+                md = float(np.sqrt(d.T @ inv_cov @ d))
+                best = min(best, md)
+            scores.append(best)
+        return torch.tensor(scores)
 
 
 # ----------------------------
@@ -684,27 +501,7 @@ class GradVecMahalanobis(OODMethod):
 # ----------------------------
 
 class TwoSidedHeadGradResidual(OODMethod):
-    """PROPOSED: learn U (classes) and V (features) and score by two-sided residual.
-
-    We learn:
-        U from covariance of delta (dL/dlogits) over ID
-        V from covariance of h (penultimate features) over ID
-
-    Then score (per-sample):
-        r = ||G_hat - U U^T G_hat V V^T||_F
-    with G_hat = G / (||G||_F + eps)
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        loss_type: str = "uniform_kl",
-        temperature: float = 1.0,
-        eps_th_u: float = 0.95,
-        eps_th_v: float = 0.95,
-        eps: float = 1e-12,
-        center_h: bool = True,
-    ):
+    def __init__(self, model: torch.nn.Module, loss_type: str = "uniform_kl", temperature: float = 1.0, eps_th_u: float = 0.95, eps_th_v: float = 0.95, eps: float = 1e-12, center_h: bool = True):
         super().__init__(model)
         self.loss_type = loss_type
         self.temperature = temperature
@@ -712,16 +509,13 @@ class TwoSidedHeadGradResidual(OODMethod):
         self.eps_th_v = eps_th_v
         self.eps = eps
         self.center_h = center_h
-        self.extractor = HeadExtractor(self.model)
-        self.U: Optional[torch.Tensor] = None  # (K,ku)
-        self.V: Optional[torch.Tensor] = None  # (d,kv)
+        self.U: Optional[torch.Tensor] = None
+        self.V: Optional[torch.Tensor] = None
         self.h_mu: Optional[torch.Tensor] = None
 
     @staticmethod
     def _top_eigvecs_from_cov(cov: torch.Tensor, eps_th: float) -> torch.Tensor:
-        # cov: (D,D) symmetric
         evals, evecs = torch.linalg.eigh(cov)
-        # sort descending
         idx = torch.argsort(evals, descending=True)
         evals = evals[idx]
         evecs = evecs[:, idx]
@@ -731,441 +525,270 @@ class TwoSidedHeadGradResidual(OODMethod):
         k = max(1, min(k, evecs.size(1)))
         return evecs[:, :k]
 
-    def fit(self, loader: Iterable[Batch]):
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         device = next(self.model.parameters()).device
-        deltas: List[torch.Tensor] = []
-        hs: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                head_io = self.extractor.forward(x)
-                hs.append(head_io.h.detach())
-        H = torch.cat(hs, dim=0)
+        H = h.to(device)
         self.h_mu = H.mean(dim=0, keepdim=True) if self.center_h else torch.zeros(1, H.size(1), device=device)
-
-        # Now compute deltas (requires grad) and gather centered hs for covariance
-        deltas = []
-        hs_c = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            logits = head_io.logits.detach().requires_grad_(True)
-            h = head_io.h
-            if self.center_h:
-                h = h - self.h_mu
-            loss = _loss_from_logits(logits, loss_type=self.loss_type, temperature=self.temperature)
-            delta = torch.autograd.grad(loss.sum(), logits, retain_graph=False, create_graph=False)[0]
-            deltas.append(delta.detach())
-            hs_c.append(h.detach())
-
-        D = torch.cat(deltas, dim=0)  # (N,K)
-        Hc = torch.cat(hs_c, dim=0)   # (N,d)
-
-        # Covariances
+        logits_d = logits.to(device)
+        D = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        Hc = H - self.h_mu if self.center_h else H
         Dm = D - D.mean(dim=0, keepdim=True)
         Hm = Hc - Hc.mean(dim=0, keepdim=True)
         cov_u = (Dm.T @ Dm) / max(1, Dm.size(0) - 1)
         cov_v = (Hm.T @ Hm) / max(1, Hm.size(0) - 1)
         cov_u = cov_u + 1e-6 * torch.eye(cov_u.size(0), device=cov_u.device)
         cov_v = cov_v + 1e-6 * torch.eye(cov_v.size(0), device=cov_v.device)
-
         self.U = self._top_eigvecs_from_cov(cov_u, self.eps_th_u).detach()
         self.V = self._top_eigvecs_from_cov(cov_v, self.eps_th_v).detach()
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.U is None or self.V is None or self.h_mu is None:
             raise RuntimeError("TwoSidedHeadGradResidual.fit must be called before scoring.")
         device = next(self.model.parameters()).device
         U = self.U.to(device)
         V = self.V.to(device)
         h_mu = self.h_mu.to(device)
-        scores: List[torch.Tensor] = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            logits = head_io.logits.detach().requires_grad_(True)
-            h = head_io.h
-            if self.center_h:
-                h = h - h_mu
-            loss = _loss_from_logits(logits, loss_type=self.loss_type, temperature=self.temperature)
-            delta = torch.autograd.grad(loss.sum(), logits, retain_graph=False, create_graph=False)[0]
-
-            # Compute residual without materializing G when possible
-            # G = delta ⊗ h
-            # Normalize by Frobenius: ||G||_F = ||delta|| * ||h||
-            nd = torch.linalg.vector_norm(delta, ord=2, dim=1).clamp_min(self.eps)
-            nh = torch.linalg.vector_norm(h, ord=2, dim=1).clamp_min(self.eps)
-            # normalized factors
-            d_hat = delta / nd.unsqueeze(1)
-            h_hat = h / nh.unsqueeze(1)
-
-            # Project factors
-            d_proj = (d_hat @ U) @ U.T
-            h_proj = (h_hat @ V) @ V.T
-            # Residual of outer product under two-sided projection:
-            # ||d_hat h_hat^T - d_proj h_proj^T||_F
-            # compute using ||A||^2 = ||a||^2||b||^2 for outer products + cross term
-            # Let A = a b^T, B = c d^T
-            # ||A-B||_F^2 = ||a||^2||b||^2 + ||c||^2||d||^2 - 2 (a^T c)(b^T d)
-            a = d_hat
-            b = h_hat
-            c = d_proj
-            d = h_proj
-            a2 = (a * a).sum(dim=1)
-            b2 = (b * b).sum(dim=1)
-            c2 = (c * c).sum(dim=1)
-            d2 = (d * d).sum(dim=1)
-            ac = (a * c).sum(dim=1)
-            bd = (b * d).sum(dim=1)
-            r2 = a2 * b2 + c2 * d2 - 2.0 * ac * bd
-            r = torch.sqrt(r2.clamp_min(0.0))
-            scores.append(r.detach().cpu())
-        return torch.cat(scores, dim=0)
+        h_d = h.to(device)
+        if self.center_h:
+            h_d = h_d - h_mu
+        logits_d = logits.to(device)
+        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        nd = torch.linalg.vector_norm(delta, ord=2, dim=1).clamp_min(self.eps)
+        nh = torch.linalg.vector_norm(h_d, ord=2, dim=1).clamp_min(self.eps)
+        d_hat = delta / nd.unsqueeze(1)
+        h_hat = h_d / nh.unsqueeze(1)
+        p_d = (d_hat @ U) @ U.T
+        p_h = (h_hat @ V) @ V.T
+        dp = (d_hat * p_d).sum(dim=1)
+        hp = (h_hat * p_h).sum(dim=1)
+        r2 = 1.0 - dp * hp
+        r = torch.sqrt(r2.clamp_min(0.0))
+        return r.cpu()
 
 
 class TwoSidedHeadGradCodeMahalanobis(OODMethod):
-    """PROPOSED: vectorize the two-sided code A=U^T G_hat V and fit class-conditional Gaussians."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        loss_type: str = "uniform_kl",
-        temperature: float = 1.0,
-        eps_th_u: float = 0.95,
-        eps_th_v: float = 0.95,
-        shrinkage: float = 1e-6,
-        center_h: bool = True,
-        include_residual: bool = True,
-        include_log_mag: bool = True,
-        eps: float = 1e-12,
-    ):
+    def __init__(self, model: torch.nn.Module, loss_type: str = "uniform_kl", temperature: float = 1.0, eps_th_u: float = 0.95, eps_th_v: float = 0.95, shrinkage: float = 1e-6, include_log_mag: bool = True, eps: float = 1e-12, center_h: bool = True):
         super().__init__(model)
         self.loss_type = loss_type
         self.temperature = temperature
         self.eps_th_u = eps_th_u
         self.eps_th_v = eps_th_v
         self.shrinkage = shrinkage
-        self.center_h = center_h
-        self.include_residual = include_residual
         self.include_log_mag = include_log_mag
         self.eps = eps
-        self.extractor = HeadExtractor(self.model)
+        self.center_h = center_h
         self.U: Optional[torch.Tensor] = None
         self.V: Optional[torch.Tensor] = None
         self.h_mu: Optional[torch.Tensor] = None
         self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
-    def _embed(self, delta: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Return embedding per sample as torch tensor on current device."""
-        assert self.U is not None and self.V is not None
-        U = self.U
-        V = self.V
-        # magnitudes
-        nd = torch.linalg.vector_norm(delta, ord=2, dim=1).clamp_min(self.eps)
-        nh = torch.linalg.vector_norm(h, ord=2, dim=1).clamp_min(self.eps)
-        d_hat = delta / nd.unsqueeze(1)
-        h_hat = h / nh.unsqueeze(1)
+    @staticmethod
+    def _top_eigvecs_from_cov(cov: torch.Tensor, eps_th: float) -> torch.Tensor:
+        evals, evecs = torch.linalg.eigh(cov)
+        idx = torch.argsort(evals, descending=True)
+        evals = evals[idx]
+        evecs = evecs[:, idx]
+        energy = evals.clamp_min(0)
+        cum = torch.cumsum(energy, dim=0) / energy.sum().clamp_min(1e-12)
+        k = int(torch.searchsorted(cum, torch.tensor(eps_th, device=cum.device)).item() + 1)
+        k = max(1, min(k, evecs.size(1)))
+        return evecs[:, :k]
 
-        # two-sided code for normalized G_hat = d_hat ⊗ h_hat
-        du = d_hat @ U  # (B,ku)
-        hv = h_hat @ V  # (B,kv)
-        # A = (du) ⊗ (hv) as ku x kv; vectorize
-        # vec(A) can be computed via outer product per sample
-        A = torch.einsum("bi,bj->bij", du, hv)  # (B,ku,kv)
-        feat_list = [A.flatten(1)]
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        if y is None:
+            raise RuntimeError("TwoSidedHeadGradCodeMahalanobis.fit requires labels.")
+        device = next(self.model.parameters()).device
+        H = h.to(device)
+        self.h_mu = H.mean(dim=0, keepdim=True) if self.center_h else torch.zeros(1, H.size(1), device=device)
+        logits_d = logits.to(device)
+        D = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        Hc = H - self.h_mu if self.center_h else H
+        Dm = D - D.mean(dim=0, keepdim=True)
+        Hm = Hc - Hc.mean(dim=0, keepdim=True)
+        cov_u = (Dm.T @ Dm) / max(1, Dm.size(0) - 1)
+        cov_v = (Hm.T @ Hm) / max(1, Hm.size(0) - 1)
+        cov_u = cov_u + 1e-6 * torch.eye(cov_u.size(0), device=cov_u.device)
+        cov_v = cov_v + 1e-6 * torch.eye(cov_v.size(0), device=cov_v.device)
+        self.U = self._top_eigvecs_from_cov(cov_u, self.eps_th_u).detach()
+        self.V = self._top_eigvecs_from_cov(cov_v, self.eps_th_v).detach()
 
-        if self.include_residual:
-            d_proj = (d_hat @ U) @ U.T
-            h_proj = (h_hat @ V) @ V.T
-            a = d_hat
-            b = h_hat
-            c = d_proj
-            d = h_proj
-            a2 = (a * a).sum(dim=1)
-            b2 = (b * b).sum(dim=1)
-            c2 = (c * c).sum(dim=1)
-            d2 = (d * d).sum(dim=1)
-            ac = (a * c).sum(dim=1)
-            bd = (b * d).sum(dim=1)
-            r2 = a2 * b2 + c2 * d2 - 2.0 * ac * bd
-            r = torch.sqrt(r2.clamp_min(0.0)).unsqueeze(1)
-            feat_list.append(r)
-
+        nd = torch.linalg.vector_norm(D, ord=2, dim=1).clamp_min(self.eps)
+        nh = torch.linalg.vector_norm(Hc, ord=2, dim=1).clamp_min(self.eps)
+        d_hat = D / nd.unsqueeze(1)
+        h_hat = Hc / nh.unsqueeze(1)
+        c_u = d_hat @ self.U
+        c_v = h_hat @ self.V
+        code = torch.cat([c_u, c_v], dim=1)
         if self.include_log_mag:
             logmag = (torch.log(nd) + torch.log(nh)).unsqueeze(1)
-            feat_list.append(logmag)
+            code = torch.cat([code, logmag], dim=1)
+            
+        Xr = code.cpu().numpy()
+        y_np = y.reshape(-1).cpu().numpy()
+        self.class_stats = {}
+        class_means = {}
+        Xr_centered = np.zeros_like(Xr)
+        for c in np.unique(y_np):
+            Xc_c = Xr[y_np == c]
+            mu = Xc_c.mean(axis=0)
+            class_means[int(c)] = mu
+            Xr_centered[y_np == c] = Xc_c - mu
+            
+        cov_c = np.cov(Xr_centered, rowvar=False) + self.shrinkage * np.eye(Xr.shape[1])
+        inv_cov = np.linalg.inv(cov_c)
+        for c in np.unique(y_np):
+            self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
 
-        return torch.cat(feat_list, dim=1)
-
-    def fit(self, loader: Iterable[Batch]):
-        # First learn U,V using the residual method's fit procedure
-        tmp = TwoSidedHeadGradResidual(
-            self.model,
-            loss_type=self.loss_type,
-            temperature=self.temperature,
-            eps_th_u=self.eps_th_u,
-            eps_th_v=self.eps_th_v,
-            center_h=self.center_h,
-        )
-        tmp.fit(loader)
-        self.U = tmp.U
-        self.V = tmp.V
-        self.h_mu = tmp.h_mu
-
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        if self.U is None or self.V is None or self.h_mu is None or not self.class_stats:
+            raise RuntimeError("TwoSidedHeadGradCodeMahalanobis.fit must be called.")
         device = next(self.model.parameters()).device
         U = self.U.to(device)
         V = self.V.to(device)
         h_mu = self.h_mu.to(device)
-        self.U, self.V, self.h_mu = U.detach(), V.detach(), h_mu.detach()
-
-        # Now collect embeddings and fit class-conditional Gaussians
-        embs: List[np.ndarray] = []
-        labels: List[int] = []
-        for x, y in _iter_inputs(loader):
-            if y is None:
-                raise RuntimeError("TwoSidedHeadGradCodeMahalanobis.fit requires labels.")
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            logits = head_io.logits.detach().requires_grad_(True)
-            h = head_io.h
-            if self.center_h:
-                h = h - self.h_mu
-            loss = _loss_from_logits(logits, loss_type=self.loss_type, temperature=self.temperature)
-            delta = torch.autograd.grad(loss.sum(), logits, retain_graph=False, create_graph=False)[0]
-            z = self._embed(delta, h).detach().cpu().numpy()
-            embs.append(z)
-            labels.extend(y.detach().cpu().reshape(-1).tolist())
-        Z = np.concatenate(embs, axis=0)
-        y = np.array(labels)
-
-        self.class_stats = {}
-        class_means = {}
-        Z_centered = np.zeros_like(Z)
-        for c in np.unique(y):
-            Zc = Z[y == c]
-            mu = Zc.mean(axis=0)
-            class_means[int(c)] = mu
-            Z_centered[y == c] = Zc - mu
-            
-        cov = np.cov(Z_centered, rowvar=False) + self.shrinkage * np.eye(Z.shape[1])
-        inv_cov = np.linalg.inv(cov)
-        
-        for c in np.unique(y):
-            self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
-
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
-        if self.U is None or self.V is None or self.h_mu is None or not self.class_stats:
-            raise RuntimeError("TwoSidedHeadGradCodeMahalanobis.fit must be called before scoring.")
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        for x, _ in _iter_inputs(loader):
-            x = _to_device(x, device)
-            head_io = self.extractor.forward(x)
-            logits = head_io.logits.detach().requires_grad_(True)
-            h = head_io.h
-            if self.center_h:
-                h = h - self.h_mu
-            loss = _loss_from_logits(logits, loss_type=self.loss_type, temperature=self.temperature)
-            delta = torch.autograd.grad(loss.sum(), logits, retain_graph=False, create_graph=False)[0]
-            Z = self._embed(delta, h).detach().cpu().numpy()
-            batch_scores = []
-            for i in range(Z.shape[0]):
-                zi = Z[i]
-                best = np.inf
-                for mu, inv_cov in self.class_stats.values():
-                    d = zi - mu
-                    md = float(np.sqrt(d.T @ inv_cov @ d))
-                    best = min(best, md)
-                batch_scores.append(best)
-            scores.append(torch.tensor(batch_scores))
-        return torch.cat(scores, dim=0)
+        h_d = h.to(device)
+        if self.center_h:
+            h_d = h_d - h_mu
+        logits_d = logits.to(device)
+        delta = _compute_delta(logits_d, loss_type=self.loss_type, temperature=self.temperature)
+        nd = torch.linalg.vector_norm(delta, ord=2, dim=1).clamp_min(self.eps)
+        nh = torch.linalg.vector_norm(h_d, ord=2, dim=1).clamp_min(self.eps)
+        d_hat = delta / nd.unsqueeze(1)
+        h_hat = h_d / nh.unsqueeze(1)
+        c_u = d_hat @ U
+        c_v = h_hat @ V
+        code = torch.cat([c_u, c_v], dim=1)
+        if self.include_log_mag:
+            logmag = (torch.log(nd) + torch.log(nh)).unsqueeze(1)
+            code = torch.cat([code, logmag], dim=1)
+        Z = code.cpu().numpy()
+        scores = []
+        for i in range(Z.shape[0]):
+            zi = Z[i]
+            best = np.inf
+            for mu, inv_cov in self.class_stats.values():
+                d = zi - mu
+                md = float(np.sqrt(d.T @ inv_cov @ d))
+                best = min(best, md)
+            scores.append(best)
+        return torch.tensor(scores)
 
 
 class FeatureGMM(OODMethod):
     def __init__(self, model: torch.nn.Module, n_components: int = 5):
         super().__init__(model)
-        self.extractor = HeadExtractor(self.model)
         self.n_components = n_components
         self.gmm: Optional[GaussianMixture] = None
 
-    def fit(self, loader: Iterable[Batch]):
-        device = next(self.model.parameters()).device
-        feats: List[np.ndarray] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                feats.append(self.extractor.forward(x).h.detach().cpu().numpy())
-        X = np.concatenate(feats, axis=0)
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        X = h.cpu().numpy()
         self.gmm = GaussianMixture(n_components=self.n_components, covariance_type='diag', random_state=42)
         self.gmm.fit(X)
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.gmm is None:
             raise RuntimeError("FeatureGMM.fit must be called before scoring.")
-        device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                h = self.extractor.forward(x).h.detach().cpu().numpy()
-                log_prob = self.gmm.score_samples(h)
-                scores.append(torch.from_numpy(-log_prob).float())
-        return torch.cat(scores, dim=0)
+        log_prob = self.gmm.score_samples(h.cpu().numpy())
+        return torch.from_numpy(-log_prob).float()
 
 
 class FeaturePCA(OODMethod):
     def __init__(self, model: torch.nn.Module, n_components: float = 0.95):
         super().__init__(model)
-        self.extractor = HeadExtractor(self.model)
         self.n_components = n_components
         self.pca_evecs: Optional[torch.Tensor] = None
         self.u_mean: Optional[torch.Tensor] = None
 
-    def fit(self, loader: Iterable[Batch]):
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
         device = next(self.model.parameters()).device
-        feats: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                feats.append(self.extractor.forward(x).h.detach())
-        H = torch.cat(feats, dim=0)
+        H = h.to(device)
         self.u_mean = H.mean(dim=0, keepdim=True)
         H_c = H - self.u_mean
-        
         cov = (H_c.T @ H_c) / max(1, H_c.size(0) - 1)
         evals, evecs = torch.linalg.eigh(cov)
         idx = torch.argsort(evals, descending=True)
         evals = evals[idx]
         evecs = evecs[:, idx]
-        
         energy = evals.clamp_min(0)
         cum = torch.cumsum(energy, dim=0) / energy.sum().clamp_min(1e-12)
         k = int(torch.searchsorted(cum, torch.tensor(self.n_components, device=cum.device)).item() + 1)
         k = max(1, min(k, evecs.size(1)))
-        
         self.pca_evecs = evecs[:, :k]
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.pca_evecs is None or self.u_mean is None:
             raise RuntimeError("FeaturePCA.fit must be called before scoring.")
         device = next(self.model.parameters()).device
         evecs = self.pca_evecs.to(device)
         u_mean = self.u_mean.to(device)
-        
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                h = self.extractor.forward(x).h
-                h_c = h - u_mean
-                proj = (h_c @ evecs) @ evecs.T
-                resid = torch.linalg.vector_norm(h_c - proj, ord=2, dim=1)
-                scores.append(resid.detach().cpu())
-        return torch.cat(scores, dim=0)
+        h_d = h.to(device)
+        h_c = h_d - u_mean
+        proj = (h_c @ evecs) @ evecs.T
+        resid = torch.linalg.vector_norm(h_c - proj, ord=2, dim=1)
+        return resid.cpu()
 
 
 class ReAct(OODMethod):
     def __init__(self, model: torch.nn.Module, p: float = 90.0, temperature: float = 1.0):
         super().__init__(model)
-        self.extractor = HeadExtractor(self.model)
         self.p = p
         self.temperature = temperature
         self.threshold: Optional[float] = None
+        self.head = HeadExtractor(model).head
 
-    def fit(self, loader: Iterable[Batch]):
-        device = next(self.model.parameters()).device
-        feats: List[np.ndarray] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                feats.append(self.extractor.forward(x).h.detach().cpu().numpy())
-        X = np.concatenate(feats, axis=0)
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        X = h.cpu().numpy()
         self.threshold = float(np.percentile(X, self.p))
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.threshold is None:
             raise RuntimeError("ReAct.fit must be called before scoring.")
         device = next(self.model.parameters()).device
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                head_io = self.extractor.forward(x)
-                h_clipped = torch.clamp(head_io.h, max=self.threshold)
-                logits_clipped = self.extractor.head(h_clipped)
-                logits = logits_clipped / self.temperature
-                energy = -torch.logsumexp(logits, dim=1)
-                scores.append(energy.detach().cpu())
-        return torch.cat(scores, dim=0)
+        h_d = h.to(device)
+        h_clipped = torch.clamp(h_d, max=self.threshold)
+        logits_clipped = self.head(h_clipped)
+        logits_out = logits_clipped / self.temperature
+        energy = -torch.logsumexp(logits_out, dim=1)
+        return energy.cpu()
 
 
 class ViM(OODMethod):
     def __init__(self, model: torch.nn.Module, dim: Optional[int] = None):
         super().__init__(model)
-        self.extractor = HeadExtractor(self.model)
         self.dim = dim 
         self.alpha: Optional[float] = None
         self.evecs_residual: Optional[torch.Tensor] = None
         self.u_mean: Optional[torch.Tensor] = None
 
-    def fit(self, loader: Iterable[Batch]):
-        device = next(self.model.parameters()).device
-        feats: List[torch.Tensor] = []
-        logits_list: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                head_io = self.extractor.forward(x)
-                feats.append(head_io.h.detach())
-                logits_list.append(head_io.logits.detach())
-                
-        H = torch.cat(feats, dim=0)
-        Logits = torch.cat(logits_list, dim=0)
-        
+    def fit_features(self, h: torch.Tensor, logits: torch.Tensor, y: Optional[torch.Tensor] = None):
+        H = h
+        Logits = logits
         self.u_mean = H.mean(dim=0, keepdim=True)
         H_c = H - self.u_mean
-        
         K = Logits.size(1)
         cov = (H_c.T @ H_c) / max(1, H_c.size(0) - 1)
         evals, evecs = torch.linalg.eigh(cov)
         idx = torch.argsort(evals, descending=True)
         evecs = evecs[:, idx]
-        
         if self.dim is None:
             self.dim = H.size(1) - K
-            
         dim = max(1, min(self.dim, H.size(1) - 1))
         self.evecs_residual = evecs[:, dim:]
-        
         residuals = torch.linalg.vector_norm(H_c @ self.evecs_residual, ord=2, dim=1)
         energies = torch.logsumexp(Logits, dim=1)
-        
         self.alpha = (energies.mean() / residuals.mean().clamp_min(1e-8)).item()
 
-    def compute_ood_scores(self, loader: Iterable[Batch]) -> torch.Tensor:
+    def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.alpha is None or self.evecs_residual is None or self.u_mean is None:
             raise RuntimeError("ViM.fit must be called before scoring.")
-        device = next(self.model.parameters()).device
-        evecs_r = self.evecs_residual.to(device)
-        u_m = self.u_mean.to(device)
-        
-        scores: List[torch.Tensor] = []
-        with torch.no_grad():
-            for x, _ in _iter_inputs(loader):
-                x = _to_device(x, device)
-                head_io = self.extractor.forward(x)
-                h = head_io.h
-                logits = head_io.logits
-                
-                h_c = h - u_m
-                res = torch.linalg.vector_norm(h_c @ evecs_r, ord=2, dim=1)
-                
-                v_logit = res * self.alpha
-                energy = torch.logsumexp(logits, dim=1)
-                
-                vim_score = v_logit - energy
-                scores.append(vim_score.detach().cpu())
-        return torch.cat(scores, dim=0)
+        evecs_r = self.evecs_residual
+        u_m = self.u_mean
+        h_c = h - u_m
+        res = torch.linalg.vector_norm(h_c @ evecs_r, ord=2, dim=1)
+        v_logit = res * self.alpha
+        energy = torch.logsumexp(logits, dim=1)
+        vim_score = v_logit - energy
+        return vim_score.cpu()
 
 # ----------------------------
 # Convenience registry
