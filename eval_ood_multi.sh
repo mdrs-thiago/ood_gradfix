@@ -1,21 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name="ood_full_grid"
-#SBATCH --partition=redecia
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --gres=gpu:1
-#SBATCH --output=logs/%j_master.out
-
-module load miniconda3
-
-. /home/$USER/miniconda3/etc/profile.d/conda.sh
-conda activate sound
-
-export CUDA_VISIBLE_DEVICES=2
 
 mkdir -p logs
+
+source ~/ood/bin/activate
 
 # -----------------------------
 # MODELS
@@ -82,7 +69,7 @@ get_ood_split () {
 # -----------------------------
 # METHODS
 # -----------------------------
-METHODS="msp,energy,odin,feat_knn,feat_maha,lowdim_grad_resid,twosided_resid,gradvec_maha"
+METHODS="msp,energy,odin,feat_knn,feat_maha,gradnorm,gradorth,lowdim_grad_resid,gradvec_maha,twosided_resid,twosided_code_maha,feat_gmm,feat_pca,react,vim"
 
 # -----------------------------
 # PARALLEL CONTROL
@@ -125,7 +112,7 @@ run_experiment () {
   echo "LOG:   $LOG_FILE"
   echo "========================================"
 
-  python hf_ood_eval.py \
+  python3 hf_ood_eval.py \
     --model_id "$MODEL" \
     --id_dataset "$ID_DATASET" \
     --ood_dataset "$REAL_OOD_DATASET" \
