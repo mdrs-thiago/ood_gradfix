@@ -672,7 +672,7 @@ class TwoSidedHeadGradCodeMahalanobis(OODMethod):
         self.U: Optional[torch.Tensor] = None
         self.V: Optional[torch.Tensor] = None
         self.h_mu: Optional[torch.Tensor] = None
-        self.class_stats: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self.class_stats: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def _top_eigvecs_from_cov(cov: torch.Tensor, eps_th: float) -> torch.Tensor:
@@ -715,21 +715,25 @@ class TwoSidedHeadGradCodeMahalanobis(OODMethod):
             logmag = (torch.log(nd) + torch.log(nh)).unsqueeze(1)
             code = torch.cat([code, logmag], dim=1)
             
-        Xr = code.cpu().numpy()
-        y_np = y.reshape(-1).cpu().numpy()
+        Z_train = code
+        y_np = y.reshape(-1).to(device)
         self.class_stats = {}
         class_means = {}
-        Xr_centered = np.zeros_like(Xr)
-        for c in np.unique(y_np):
-            Xc_c = Xr[y_np == c]
-            mu = Xc_c.mean(axis=0)
-            class_means[int(c)] = mu
-            Xr_centered[y_np == c] = Xc_c - mu
+        Z_centered = torch.zeros_like(Z_train)
+        classes = torch.unique(y_np)
+        
+        for c in classes:
+            Z_c = Z_train[y_np == c]
+            mu = Z_c.mean(dim=0)
+            class_means[int(c.item())] = mu
+            Z_centered[y_np == c] = Z_c - mu
             
-        cov_c = np.cov(Xr_centered, rowvar=False) + self.shrinkage * np.eye(Xr.shape[1])
-        inv_cov = np.linalg.inv(cov_c)
-        for c in np.unique(y_np):
-            self.class_stats[int(c)] = (class_means[int(c)], inv_cov)
+        cov_c = (Z_centered.T @ Z_centered) / max(1, Z_train.size(0) - 1)
+        cov_c = cov_c + self.shrinkage * torch.eye(Z_train.size(1), device=device)
+        inv_cov = torch.linalg.inv(cov_c)
+        
+        for c in classes:
+            self.class_stats[int(c.item())] = (class_means[int(c.item())].cpu(), inv_cov.cpu())
 
     def compute_ood_scores_features(self, h: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
         if self.U is None or self.V is None or self.h_mu is None or not self.class_stats:
@@ -753,17 +757,22 @@ class TwoSidedHeadGradCodeMahalanobis(OODMethod):
         if self.include_log_mag:
             logmag = (torch.log(nd) + torch.log(nh)).unsqueeze(1)
             code = torch.cat([code, logmag], dim=1)
-        Z = code.cpu().numpy()
+            
+        Z_test = code
         scores = []
-        for i in range(Z.shape[0]):
-            zi = Z[i]
-            best = np.inf
+        batch_size = 512
+        for i in range(0, Z_test.size(0), batch_size):
+            z_b = Z_test[i:i+batch_size]
+            b_scores = torch.full((z_b.size(0),), float('inf'), device=device)
             for mu, inv_cov in self.class_stats.values():
-                d = zi - mu
-                md = float(np.sqrt(d.T @ inv_cov @ d))
-                best = min(best, md)
-            scores.append(best)
-        return torch.tensor(scores)
+                mu = mu.to(device)
+                inv_cov = inv_cov.to(device)
+                diff = z_b - mu
+                dist = torch.sqrt((diff @ inv_cov * diff).sum(dim=1).clamp_min(0))
+                b_scores = torch.min(b_scores, dist)
+            scores.append(b_scores.cpu())
+            
+        return torch.cat(scores, dim=0)
 
 
 class FeatureGMM(OODMethod):
