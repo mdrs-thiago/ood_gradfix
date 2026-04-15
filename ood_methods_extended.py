@@ -585,7 +585,7 @@ class GradVecMahalanobis(OODMethod):
                 z_scores = torch.min(z_scores, dist)
             scores.append(z_scores.cpu())
             
-        return torch.cat(scores, dim=0)
+        return torch.cat(-scores, dim=0)
 
 
 # ----------------------------
